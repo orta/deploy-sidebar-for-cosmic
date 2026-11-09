@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Deploy Sidebar Settings
+Comment=Grafana, Render and metrics for the deploy health sidebar
+Exec=cosmic-deploy-sidebar settings
+Icon=preferences-system-symbolic
+Categories=Development;Settings;
+Terminal=false

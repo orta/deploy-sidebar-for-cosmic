@@ -1,0 +1,12 @@
+[Unit]
+Description=Deploy health sidebar for COSMIC
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/cosmic-deploy-sidebar
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

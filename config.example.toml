@@ -1,0 +1,101 @@
+# cosmic-deploy-sidebar config, read from ~/.config/cosmic-deploy-sidebar/config.toml
+#
+# Every query goes through Grafana's /api/ds/query, so Prometheus can stay private.
+# Each `expr` should return a single series; multiple series are summed per timestamp.
+
+# The Grafana instance, and the UID of its Prometheus datasource
+# (Connections -> Data sources -> Prometheus, the UID is in the URL).
+grafana_url = "https://grafana.example.com"
+datasource_uid = "REPLACE_ME"
+
+# How long the sidebar stays up after a deploy goes live.
+window_minutes = 10
+# The pre-deploy period each metric is compared against.
+baseline_minutes = 30
+
+# Prometheus scrapes once a minute, so polling metrics faster than that gains nothing.
+render_poll_seconds = 20
+metrics_poll_seconds = 60
+
+# `unit` is one of: count, per_second, seconds, bytes, ratio
+# `worse` is the direction that means trouble: "higher" or "lower"
+# `floor` is a value below which a metric is never flagged, so a rate going from 0.001 to
+# 0.003 does not count as tripling.
+
+[[services]]
+name = "api"
+render_service_id = "srv-cenh9k9gp3jlcsj3147g"
+
+[[services.metrics]]
+label = "Requests"
+expr = 'sum(rate(http_request_duration_seconds_count{job="puzzmo-api"}[2m]))'
+unit = "per_second"
+worse = "lower"
+
+[[services.metrics]]
+label = "p95 latency"
+expr = 'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="puzzmo-api"}[2m])))'
+unit = "seconds"
+worse = "higher"
+floor = 0.2
+
+[[services.metrics]]
+label = "5xx"
+expr = 'sum(rate(http_request_duration_seconds_count{job="puzzmo-api", status_code=~"5.."}[2m])) or vector(0)'
+unit = "per_second"
+worse = "higher"
+floor = 0.05
+
+[[services.metrics]]
+label = "DB pool timeouts"
+expr = 'sum(rate(db_pool_timeouts_total{job="puzzmo-api"}[2m])) or vector(0)'
+unit = "per_second"
+worse = "higher"
+floor = 0.01
+
+[[services.metrics]]
+label = "Event loop p99"
+expr = 'max(nodejs_eventloop_lag_p99_seconds{job="puzzmo-api"})'
+unit = "seconds"
+worse = "higher"
+floor = 0.05
+
+[[services.metrics]]
+label = "Memory (max)"
+expr = 'max(process_resident_memory_bytes{job="puzzmo-api"})'
+unit = "bytes"
+worse = "higher"
+floor = 536870912
+
+[[services]]
+name = "puzzmo.com"
+# Run `cosmic-deploy-sidebar list-services` to find this.
+render_service_id = "REPLACE_ME"
+
+[[services.metrics]]
+label = "Documents"
+expr = 'sum(rate(ssr_documents_total{job="ssr"}[2m]))'
+unit = "per_second"
+worse = "lower"
+
+# timeout and error both answer HTTP 200 with an empty shell, so status codes miss them.
+[[services.metrics]]
+label = "Failed SSR"
+expr = 'sum(rate(ssr_documents_total{job="ssr", outcome=~"timeout|error"}[2m])) / sum(rate(ssr_documents_total{job="ssr"}[2m]))'
+unit = "ratio"
+worse = "higher"
+floor = 0.01
+
+[[services.metrics]]
+label = "p95 document"
+expr = 'histogram_quantile(0.95, sum by (le) (rate(ssr_document_duration_seconds_bucket{job="ssr"}[2m])))'
+unit = "seconds"
+worse = "higher"
+floor = 0.5
+
+[[services.metrics]]
+label = "In flight"
+expr = 'sum(ssr_requests_in_flight{job="ssr"})'
+unit = "count"
+worse = "higher"
+floor = 5
