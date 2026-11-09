@@ -33,6 +33,8 @@ pub struct Deploy {
     pub status: DeployStatus,
     /// Short commit SHA.
     pub revision: Option<String>,
+    /// Full commit SHA.
+    pub commit_id: Option<String>,
     pub commit_message: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -105,11 +107,34 @@ pub async fn latest_deploy(api_key: &str, service_id: &str) -> Result<Option<Dep
                 .as_ref()
                 .and_then(|c| c.id.as_deref())
                 .map(|sha| sha.chars().take(7).collect()),
+            commit_id: d.commit.as_ref().and_then(|c| c.id.clone()),
             commit_message: d.commit.and_then(|c| c.message),
             created_at: d.created_at,
             finished_at: d.finished_at,
         }
     }))
+}
+
+/// The commit of the deploy that was live before `deploy_id`, to diff the deploy against.
+pub async fn previous_commit(
+    api_key: &str,
+    service_id: &str,
+    deploy_id: &str,
+) -> Result<Option<String>, String> {
+    let url = format!("{API_BASE}/services/{service_id}/deploys?limit=20");
+    let items: Vec<DeployItem> = get(api_key, &url).await?;
+    Ok(items
+        .into_iter()
+        .map(|item| item.deploy)
+        .skip_while(|d| d.id != deploy_id)
+        .skip(1)
+        .find(|d| {
+            matches!(
+                parse_status(&d.status),
+                DeployStatus::Live | DeployStatus::Superseded
+            )
+        })
+        .and_then(|d| d.commit.and_then(|c| c.id)))
 }
 
 /// Fetch the services on the account (first page only), sorted by name.

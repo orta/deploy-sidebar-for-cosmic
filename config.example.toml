@@ -25,6 +25,11 @@ metrics_poll_seconds = 60
 [[services]]
 name = "api"
 render_service_id = "srv-cenh9k9gp3jlcsj3147g"
+# Optional: local clones of the repo. When set, each deploy runs a read-only `claude -p` in
+# the clone that best matches the deployed commit, and lists what to test by hand under the
+# stats. `repo_path` is the service's folder in the repo, so the list sticks to its changes.
+# repos = ["~/dev/app", "~/dev/app-2"]
+# repo_path = "apps/api"
 
 [[services.metrics]]
 label = "Requests"

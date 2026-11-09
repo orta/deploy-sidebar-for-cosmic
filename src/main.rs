@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 mod app;
+mod checklist;
 mod cli;
 mod config;
 mod grafana;

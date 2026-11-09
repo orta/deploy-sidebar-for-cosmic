@@ -1,6 +1,6 @@
 # Deploy Sidebar for COSMIC
 
-A sidebar for the COSMIC desktop. It appears in the top right when a watched Render service deploys, shows server health against the 30 minutes before the deploy, and fades away 10 minutes after the deploy goes live. If a metric still looks bad at that point, it stays until dismissed.
+A sidebar for the COSMIC desktop. It appears in the top right when a watched Render service deploys, shows server health against the 30 minutes before the deploy, and fades away 10 minutes after the deploy goes live. If a metric still looks bad at that point, it stays until dismissed. Closing a card with ✕ hides it until the next deploy, but the sidebar keeps watching that deploy and brings the card back if it fails or a metric starts to look bad.
 
 It sits alongside [cosmic-deploys](https://github.com/orta/cosmic-deploys), the panel applet, and reads the Render key that applet stores in the keyring.
 
@@ -12,6 +12,7 @@ There is also a native macOS version, written in SwiftUI, in [`macos/`](macos/).
 - When a deploy starts building, the sidebar shows it with the elapsed time.
 - Once the deploy is live, each configured PromQL query runs through Grafana's `/api/ds/query` once a minute. Prometheus stays private, because Grafana proxies the queries.
 - Each metric gets a sparkline (bars before the deploy are dimmed), its current value, and its change from the pre-deploy mean. A metric 25% worse than its baseline is a warning; 50% worse is bad. `floor` stops tiny values from being flagged.
+- If a service lists `repos` (local clones of its repo), each deploy also runs a read-only `claude -p` in the clone that has the deployed commit, preferring one with it checked out and a clean tree. Claude reads the diff since the previous deploy and writes up to six things to test by hand, which appear under the stats as a checklist. The card stays up until they are ticked or closed. `cosmic-deploy-sidebar checklist <service>` prints the same list in the terminal. The settings window has no fields for this yet, so add `repos` and `repo_path` to the TOML by hand.
 
 ## Setup
 
@@ -28,7 +29,7 @@ In settings:
 
 Saving writes `~/.config/cosmic-deploy-sidebar/config.toml`, and a running sidebar reloads it within a few seconds. The file is still plain TOML; `config.example.toml` documents the fields, but saving from the window drops comments.
 
-The same steps also work from the terminal: `init-config`, `set-grafana-token`, `set-render-key`, `list-services`, `check`.
+The same steps also work from the terminal: `init-config`, `set-grafana-token`, `set-render-key`, `list-services`, `check`, `checklist <service>`.
 
 ## Development
 

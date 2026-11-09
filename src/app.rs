@@ -3,6 +3,7 @@
 //! The sidebar: idle until a watched service deploys, then a layer surface pinned to the top
 //! right showing each metric against its pre-deploy baseline, fading out once the window ends.
 
+use crate::checklist::Checklist;
 use crate::config::{self, Config};
 use crate::grafana::{Grafana, SeriesResult};
 use crate::health::{self, Level};
@@ -57,6 +58,41 @@ struct Watch {
     series: Vec<SeriesResult>,
     /// Set when the whole metrics request failed, e.g. a bad token.
     error: Option<String>,
+    /// Closed by the user. Still polled, so a failure or regression can bring it back.
+    dismissed: bool,
+    /// It already looked bad when dismissed, so only a fresh regression reopens it.
+    dismissed_while_bad: bool,
+    checklist: ChecklistState,
+    /// Aborts the `claude -p` run when the watch is dropped.
+    checklist_task: Option<cosmic::iced::task::Handle>,
+}
+
+/// The testing checklist Claude writes for a deploy, when the service lists repo clones.
+enum ChecklistState {
+    Off,
+    Pending,
+    Ready(Checklist, Vec<bool>),
+    Failed(String),
+}
+
+impl ChecklistState {
+    /// Whether the card should stay up past its window for this.
+    fn holds(&self) -> bool {
+        match self {
+            ChecklistState::Pending => true,
+            ChecklistState::Ready(_, done) => done.iter().any(|d| !d),
+            ChecklistState::Off | ChecklistState::Failed(_) => false,
+        }
+    }
+
+    /// Lines the checklist section takes in the card.
+    fn lines(&self) -> usize {
+        match self {
+            ChecklistState::Off => 0,
+            ChecklistState::Pending | ChecklistState::Failed(_) => 1,
+            ChecklistState::Ready(c, _) => 1 + c.items.len().max(usize::from(c.note.is_some())),
+        }
+    }
 }
 
 pub struct App {
@@ -98,6 +134,11 @@ pub enum Message {
     CheckConfig,
     OpenSettings,
     Open(String),
+    ChecklistFetched {
+        deploy_id: String,
+        result: Result<Checklist, String>,
+    },
+    ToggleTodo(String, usize),
 }
 
 impl cosmic::Application for App {
@@ -157,7 +198,7 @@ impl cosmic::Application for App {
         if let Some(notice) = &self.notice {
             column = column.push(Self::notice_card(notice, &palette));
         }
-        for watch in &self.watches {
+        for watch in self.visible_watches() {
             column = column.push(self.watch_card(watch, &palette));
         }
 
@@ -198,7 +239,8 @@ impl cosmic::Application for App {
                 cosmic::iced::time::every(Duration::from_secs(3)).map(|_| Message::CheckConfig),
             );
         }
-        if self.surface.is_some() {
+        // Dismissed watches still need sweeping when nothing is on screen.
+        if self.surface.is_some() || !self.watches.is_empty() {
             subscriptions
                 .push(cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
         }
@@ -242,17 +284,28 @@ impl cosmic::Application for App {
                     }
                     Err(e) => watch.error = Some(e),
                 }
+                self.reopen_if_regressed(&deploy_id);
                 return self.sync_surface();
             }
             Message::Tick => return self.sweep(),
             Message::Frame => {
                 if self.fade_started.is_some_and(|t| t.elapsed() >= FADE_OUT) {
-                    self.watches.clear();
+                    // Dismissed watches keep watching for regressions until their window ends.
+                    self.watches.retain(|w| w.dismissed);
                     return self.sync_surface();
                 }
             }
             Message::Dismiss(deploy_id) => {
-                self.watches.retain(|w| w.deploy.id != deploy_id);
+                let metrics: Vec<&[config::Metric]> =
+                    self.config.as_ref().map_or_else(Vec::new, |c| {
+                        c.services.iter().map(|s| s.metrics.as_slice()).collect()
+                    });
+                if let Some(watch) = self.watches.iter_mut().find(|w| w.deploy.id == deploy_id) {
+                    let metrics = metrics.get(watch.service).copied().unwrap_or(&[]);
+                    watch.dismissed = true;
+                    watch.dismissed_while_bad =
+                        watch.phase == Phase::Failed || worst_level(watch, metrics) == Level::Bad;
+                }
                 return self.sync_surface();
             }
             Message::DismissNotice => {
@@ -267,6 +320,33 @@ impl cosmic::Application for App {
             }
             Message::Open(url) => {
                 let _ = open::that_detached(url);
+            }
+            Message::ChecklistFetched { deploy_id, result } => {
+                if let Some(watch) = self.watches.iter_mut().find(|w| w.deploy.id == deploy_id) {
+                    watch.checklist_task = None;
+                    watch.checklist = match result {
+                        Ok(checklist) => {
+                            let done = vec![false; checklist.items.len()];
+                            ChecklistState::Ready(checklist, done)
+                        }
+                        Err(e) => {
+                            eprintln!("Checklist: {e}");
+                            ChecklistState::Failed(e)
+                        }
+                    };
+                }
+                return self.sync_surface();
+            }
+            Message::ToggleTodo(deploy_id, index) => {
+                if let Some(ChecklistState::Ready(_, done)) = self
+                    .watches
+                    .iter_mut()
+                    .find(|w| w.deploy.id == deploy_id)
+                    .map(|w| &mut w.checklist)
+                    && let Some(d) = done.get_mut(index)
+                {
+                    *d = !*d;
+                }
             }
         }
         Task::none()
@@ -310,6 +390,7 @@ impl App {
             id: id.into(),
             status: DeployStatus::Live,
             revision: Some("23675c8".into()),
+            commit_id: None,
             commit_message: Some(message.into()),
             created_at: started,
             finished_at: Some(live_at),
@@ -360,6 +441,21 @@ impl App {
                     baselines,
                     series,
                     error: None,
+                    dismissed: false,
+                    dismissed_while_bad: false,
+                    checklist: ChecklistState::Ready(
+                        Checklist {
+                            clone: "app2".into(),
+                            items: vec![
+                                "Open a calendar playlist and play a puzzle".into(),
+                                "Reorder a playlist and check it saves".into(),
+                                "Load the calendar logged out".into(),
+                            ],
+                            note: None,
+                        },
+                        vec![true, false, false],
+                    ),
+                    checklist_task: None,
                 },
                 Watch {
                     service: 1,
@@ -373,6 +469,10 @@ impl App {
                     baselines: Vec::new(),
                     series: Vec::new(),
                     error: None,
+                    dismissed: false,
+                    dismissed_while_bad: false,
+                    checklist: ChecklistState::Pending,
+                    checklist_task: None,
                 },
             ],
             notice: None,
@@ -452,12 +552,25 @@ impl App {
     ) -> Task<cosmic::Action<Message>> {
         let deploy_id = deploy.id.clone();
         let metric_count = self.metrics(service).len();
-        // Keep baselines across the Building -> Live transition.
-        let baselines = self
+        // Keep baselines and the checklist across the Building -> Live transition, and a
+        // dismissal unless it failed.
+        let previous = self
             .watches
             .iter()
-            .find(|w| w.deploy.id == deploy_id)
+            .position(|w| w.deploy.id == deploy_id)
+            .map(|i| self.watches.remove(i));
+        let baselines = previous
+            .as_ref()
             .map_or_else(|| vec![None; metric_count], |w| w.baselines.clone());
+        let dismissed = phase != Phase::Failed && previous.as_ref().is_some_and(|w| w.dismissed);
+        let (checklist, checklist_task, launch) = match previous {
+            _ if phase == Phase::Failed => (ChecklistState::Off, None, None),
+            Some(w) => (w.checklist, w.checklist_task, None),
+            None => match self.start_checklist(service, &deploy) {
+                Some((task, handle)) => (ChecklistState::Pending, Some(handle), Some(task)),
+                None => (ChecklistState::Off, None, None),
+            },
+        };
 
         self.watches.retain(|w| w.service != service);
         self.watches.push(Watch {
@@ -467,16 +580,53 @@ impl App {
             baselines,
             series: (0..metric_count).map(|_| Ok(Vec::new())).collect(),
             error: None,
+            dismissed,
+            dismissed_while_bad: false,
+            checklist,
+            checklist_task,
         });
         self.watches.sort_by_key(|w| w.service);
         self.fade_started = None;
 
         let mut tasks = vec![self.sync_surface()];
+        tasks.extend(launch);
         if matches!(phase, Phase::Live(_)) {
             tasks.push(self.fetch_metrics(&deploy_id, true));
             tasks.push(self.fetch_metrics(&deploy_id, false));
         }
         Task::batch(tasks)
+    }
+
+    /// Ask Claude for a testing checklist, when the service lists repo clones.
+    fn start_checklist(
+        &self,
+        service: usize,
+        deploy: &Deploy,
+    ) -> Option<(Task<cosmic::Action<Message>>, cosmic::iced::task::Handle)> {
+        let config = self.config.as_ref()?.services.get(service)?;
+        let to = deploy.commit_id.clone()?;
+        if config.repos.is_empty() {
+            return None;
+        }
+        let key = self.render_key.clone();
+        let service_id = config.render_service_id.clone();
+        let name = config.name.clone();
+        let repos = config.repo_dirs();
+        let repo_path = config.repo_path.clone();
+        let deploy_id = deploy.id.clone();
+        let (task, handle) = task(async move {
+            let from = match &key {
+                Some(key) => render::previous_commit(key, &service_id, &deploy_id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let result = crate::checklist::generate(name, repos, repo_path, from, to).await;
+            Message::ChecklistFetched { deploy_id, result }
+        })
+        .abortable();
+        Some((task, handle.abort_on_drop()))
     }
 
     /// Query every metric for a deploy: the pre-deploy baseline, or the window around it.
@@ -530,12 +680,17 @@ impl App {
             .collect();
         let finished = |w: &Watch| match w.phase {
             Phase::Live(at) => {
-                now - at >= window && worst_level(w, metrics[w.service]) < Level::Bad
+                now - at >= window
+                    && worst_level(w, metrics[w.service]) < Level::Bad
+                    && (w.dismissed || !w.checklist.holds())
             }
-            _ => false,
+            // Nothing brings back a dismissed failure, so stop tracking it.
+            Phase::Failed => w.dismissed,
+            Phase::Building => false,
         };
 
-        if self.notice.is_none() && !self.watches.is_empty() && self.watches.iter().all(finished) {
+        let mut visible = self.watches.iter().filter(|w| !w.dismissed).peekable();
+        if self.notice.is_none() && visible.peek().is_some() && visible.all(finished) {
             self.fade_started.get_or_insert_with(Instant::now);
             return Task::none();
         }
@@ -546,7 +701,7 @@ impl App {
 
     /// Create, resize or destroy the layer surface to match what there is to show.
     fn sync_surface(&mut self) -> Task<cosmic::Action<Message>> {
-        let wanted = self.notice.is_some() || !self.watches.is_empty();
+        let wanted = self.notice.is_some() || self.visible_watches().next().is_some();
         let height = self.content_height();
         match (wanted, self.surface) {
             (true, Some(id)) if height != self.surface_height => {
@@ -598,7 +753,7 @@ impl App {
             height += 24.0 + lines * 20.0 + 26.0;
             cards += 1.0;
         }
-        for watch in &self.watches {
+        for watch in self.visible_watches() {
             // Header and commit line, inside the card's padding.
             height += 20.0 + 24.0 + 6.0 + 18.0;
             if matches!(watch.phase, Phase::Live(_)) {
@@ -608,6 +763,12 @@ impl App {
                 if watch.error.is_some() {
                     height += 24.0;
                 }
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let lines = watch.checklist.lines() as f32;
+            if lines > 0.0 {
+                // A divider row, then one line per item.
+                height += 6.0 + lines * (18.0 + 6.0);
             }
             cards += 1.0;
         }
@@ -633,6 +794,34 @@ impl App {
         self.watches
             .iter()
             .filter(|w| matches!(w.phase, Phase::Live(_)))
+    }
+
+    /// Watches that have not been dismissed.
+    fn visible_watches(&self) -> impl Iterator<Item = &Watch> {
+        self.watches.iter().filter(|w| !w.dismissed)
+    }
+
+    /// Bring a dismissed watch back when a metric newly looks bad.
+    fn reopen_if_regressed(&mut self, deploy_id: &str) {
+        let Some(config) = &self.config else {
+            return;
+        };
+        let Some(watch) = self.watches.iter_mut().find(|w| w.deploy.id == deploy_id) else {
+            return;
+        };
+        if !watch.dismissed {
+            return;
+        }
+        let metrics = config
+            .services
+            .get(watch.service)
+            .map_or(&[][..], |s| s.metrics.as_slice());
+        if worst_level(watch, metrics) < Level::Bad {
+            watch.dismissed_while_bad = false;
+        } else if !watch.dismissed_while_bad {
+            watch.dismissed = false;
+            self.fade_started = None;
+        }
     }
 
     fn service_name(&self, service: usize) -> &str {
@@ -679,8 +868,10 @@ impl App {
                 let level = worst_level(watch, metrics);
                 let text = if left > TimeDelta::zero() {
                     format!("live · {} left", duration(left))
-                } else {
+                } else if level == Level::Bad {
                     "live · held, something looks off".to_string()
+                } else {
+                    "live · held for the checklist".to_string()
                 };
                 (text, palette.level(level))
             }
@@ -730,6 +921,12 @@ impl App {
                 card = card.push(metric_row(
                     metric, points, error, baseline, live_at, palette,
                 ));
+            }
+        }
+        if !matches!(watch.checklist, ChecklistState::Off) {
+            card = card.push(rule(palette.divider));
+            for line in checklist_lines(watch, palette) {
+                card = card.push(line);
             }
         }
 
@@ -882,6 +1079,61 @@ fn link<'a>(label: impl Into<String>, color: Color, message: Message) -> Element
         .on_press(message)
         .interaction(cosmic::iced::mouse::Interaction::Pointer)
         .into()
+}
+
+/// A one pixel horizontal line, coloured from the palette so it fades.
+fn rule<'a>(color: Color) -> Element<'a, Message> {
+    widget::container(widget::Space::new(Length::Fill, 1))
+        .class(cosmic::theme::Container::custom(move |_| {
+            cosmic::iced::widget::container::Style {
+                background: Some(color.into()),
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
+/// The checklist section: a status line, then one tickable line per item.
+fn checklist_lines<'a>(watch: &'a Watch, palette: &Palette) -> Vec<Element<'a, Message>> {
+    let caption = |text: String, color: Color| -> Element<'a, Message> {
+        widget::text::caption(text).class(text_color(color)).into()
+    };
+    match &watch.checklist {
+        ChecklistState::Off => Vec::new(),
+        ChecklistState::Pending => {
+            vec![caption("Asking Claude what to test…".into(), palette.muted)]
+        }
+        ChecklistState::Failed(e) => vec![caption(
+            truncate(&format!("No checklist: {e}"), 56),
+            palette.muted,
+        )],
+        ChecklistState::Ready(checklist, done) => {
+            let left = done.iter().filter(|d| !**d).count();
+            let heading = if checklist.items.is_empty() {
+                format!("To test · {}", checklist.clone)
+            } else {
+                format!("To test · {left} left · {}", checklist.clone)
+            };
+            let mut lines = vec![caption(heading, palette.muted)];
+            if let Some(note) = &checklist.note {
+                lines.push(caption(note.clone(), palette.text));
+            }
+            for (i, item) in checklist.items.iter().enumerate() {
+                let ticked = done.get(i).copied().unwrap_or(false);
+                let (mark, color) = if ticked {
+                    ("☑", palette.muted)
+                } else {
+                    ("☐", palette.text)
+                };
+                lines.push(link(
+                    format!("{mark}  {}", truncate(item, 52)),
+                    color,
+                    Message::ToggleTodo(watch.deploy.id.clone(), i),
+                ));
+            }
+            lines
+        }
+    }
 }
 
 /// The most severe level across a watch's metrics.

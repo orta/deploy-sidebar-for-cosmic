@@ -23,10 +23,11 @@ Usage:
   cosmic-deploy-sidebar set-render-key       Store a Render API key (reads stdin)
   cosmic-deploy-sidebar list-services        List Render services and their IDs
   cosmic-deploy-sidebar check                Run every configured query and print the results
+  cosmic-deploy-sidebar checklist <service>  Ask Claude what to test for a service's latest deploy
 ";
 
 /// Run a subcommand, returning the process exit code.
-pub fn run(command: &str, _args: &[String]) -> i32 {
+pub fn run(command: &str, args: &[String]) -> i32 {
     let result = match command {
         "init-config" => init_config(),
         "set-grafana-token" => read_secret("Grafana token")
@@ -35,6 +36,10 @@ pub fn run(command: &str, _args: &[String]) -> i32 {
             .and_then(|k| keyring::store_render_api_key(&k).map_err(|e| e.to_string())),
         "list-services" => block_on(list_services()),
         "check" => block_on(check()),
+        "checklist" => match args.first() {
+            Some(name) => block_on(checklist(name)),
+            None => Err("Usage: cosmic-deploy-sidebar checklist <service>".into()),
+        },
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())
@@ -118,6 +123,46 @@ async fn check() -> Result<(), String> {
             };
             println!("  {:<20} {line}", metric.label);
         }
+    }
+    Ok(())
+}
+
+/// Generate the checklist the sidebar would show for a service's latest deploy.
+async fn checklist(name: &str) -> Result<(), String> {
+    let config = config::load()?;
+    let service = config
+        .services
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| format!("No service called {name} in the config"))?;
+    if service.repos.is_empty() {
+        return Err(format!("{name} has no `repos` in the config"));
+    }
+    let key = keyring::render_api_key().ok_or("No Render API key, run set-render-key")?;
+    let deploy = render::latest_deploy(&key, &service.render_service_id)
+        .await?
+        .ok_or("The service has no deploys")?;
+    let to = deploy.commit_id.ok_or("The latest deploy has no commit")?;
+    let from = render::previous_commit(&key, &service.render_service_id, &deploy.id).await?;
+    eprintln!(
+        "Asking Claude about {}..{}",
+        from.as_deref().map_or("?", |f| &f[..f.len().min(7)]),
+        &to[..to.len().min(7)]
+    );
+    let checklist = crate::checklist::generate(
+        service.name.clone(),
+        service.repo_dirs(),
+        service.repo_path.clone(),
+        from,
+        to,
+    )
+    .await?;
+    println!("In {}:", checklist.clone);
+    if let Some(note) = checklist.note {
+        println!("  {note}");
+    }
+    for item in checklist.items {
+        println!("  - {item}");
     }
     Ok(())
 }

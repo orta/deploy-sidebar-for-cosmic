@@ -298,6 +298,8 @@ impl cosmic::Application for SettingsApp {
                     name: String::new(),
                     render_service_id: String::new(),
                     metrics: Vec::new(),
+                    repos: Vec::new(),
+                    repo_path: None,
                 });
                 self.floors.push(Vec::new());
             }

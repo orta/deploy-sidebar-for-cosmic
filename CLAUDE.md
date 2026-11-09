@@ -7,6 +7,7 @@ A COSMIC desktop sidebar that appears when a watched Render service deploys, sho
 - `src/app.rs` - the libcosmic app: deploy state machine (`Phase`: Building / Live / Failed), layer surface lifecycle, fade animation, view
 - `src/render.rs` - Render API, latest deploy per service
 - `src/grafana.rs` - PromQL through Grafana's `/api/ds/query`; multi-series results are summed per timestamp
+- `src/checklist.rs` - when a service lists `repos`, each new deploy runs a read-only `claude -p --json-schema` in the clone that best matches the deployed commit (has `prev..new`, has it checked out, clean, fewest commits past it). The range comes from `render::previous_commit`. Started when the deploy is first seen, kept across Building -> Live, aborted via an iced `Handle` (plus `kill_on_drop`) when the watch is dropped. Unticked items hold the card past its window. `cosmic-deploy-sidebar checklist <service>` runs it from the terminal
 - `src/health.rs` - baseline comparison (`assess`), value formatting
 - `src/config.rs` + `config.example.toml` - TOML config at `~/.config/cosmic-deploy-sidebar/config.toml`; the example is embedded and used by `init-config` and `--demo`
 - `src/settings.rs` - the settings window (`cosmic-deploy-sidebar settings`), a normal libcosmic app with a main window, run as its own process. It saves the TOML config and keyring entries; the sidebar polls the config mtime every 3s and reloads (`App::reload_if_changed`), keeping watches unless the service IDs changed
@@ -43,12 +44,14 @@ Puzzmo's Grafana uses GitHub OAuth for browser login. That doesn't affect the AP
 - `cargo run -- settings` opens the settings window; it is a normal toplevel, so it lands on the focused monitor. In the demo screenshot it was at roughly x 4440-5440 of the 6880-wide capture.
 - `cargo run -- --demo` shows synthetic deploys with no network: a live api deploy with a latency regression, and a building puzzmo.com deploy.
 - The user's setup has two 3440x1440 monitors side by side (6880x1440 total). The surface opens on the focused output. To check rendering:
+
   ```bash
   (timeout 8 ./target/debug/cosmic-deploy-sidebar --demo >/dev/null 2>&1 &); sleep 4
   cosmic-screenshot --interactive=false --modal=false --notify=false --save-dir <dir>
   convert <shot>.png -crop 520x520+2920+0 a.png   # top right of the left monitor
   convert <shot>.png -crop 520x520+6360+0 b.png   # top right of the right monitor
   ```
+
   Use `command ls` in scripts (`ls` is aliased with colours). PIL is not installed; ImageMagick is.
 - The sidebar pops up on the user's real desktop when run, so keep test runs short and tell them.
 
@@ -65,7 +68,7 @@ A SwiftUI and AppKit port, built as a Swift package with no dependencies. `make`
 - `Sources/DeploySidebar` holds `Main` (CLI dispatch, then the SwiftUI `App` with a `MenuBarExtra`), `AppDelegate`, `SidebarPanel`, `SidebarView`, `SettingsModel`/`SettingsView`, `CLI` and `LoginItem`.
 - It uses the same config path and TOML format as Linux. `TOML.swift` is a hand-written parser for the subset the config needs, and `toTOML()` writes the file back.
 - `ExampleConfig.swift` is generated from `../config.example.toml` by `make example`. `ConfigTests` fails if the two drift.
-- Keychain service `io.orta.DeploySidebar`, accounts `grafana_token` / `render_api_key`. The Render key falls back to `io.orta.RenderVercelDeploy`, the menu bar app in `../render-vercel-deploy-info`. Ad-hoc signing means the Keychain prompts again after each rebuild; `SIGN_IDENTITY` overrides it. The identities on this Mac belong to Ben Maslen and Puzzmo Inc., so don't pick one without asking.
+- Keychain service `io.orta.DeploySidebar`, accounts `grafana_token` / `render_api_key`. The Render key falls back to `io.orta.RenderVercelDeploy`, the menu bar app in `../render-vercel-deploy-info`. Ad-hoc signing means the Keychain prompts again after each rebuild; `SIGN_IDENTITY` overrides it. The identities on this Mac belong to Puzzmo Inc., so don't pick one without asking.
 - `SidebarModel.clock` is injectable, and tests use it to step through the window and fade. Models built by `init(setup:)` never read the real config file.
 
 ### macOS gotchas

@@ -26,8 +26,29 @@ pub struct Config {
 pub struct Service {
     pub name: String,
     pub render_service_id: String,
+    /// Local clones of the service's repo. When set, `claude -p` writes a testing checklist for
+    /// each deploy, run in whichever clone best matches the deployed commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+    /// The service's folder inside the repo, so the checklist focuses on its changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
     #[serde(default)]
     pub metrics: Vec<Metric>,
+}
+
+impl Service {
+    /// The repo clones with `~` expanded.
+    pub fn repo_dirs(&self) -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.repos
+            .iter()
+            .map(|r| match (r.strip_prefix("~/"), &home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                _ => PathBuf::from(r),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
