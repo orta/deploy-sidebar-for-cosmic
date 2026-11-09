@@ -56,3 +56,28 @@ Puzzmo's Grafana uses GitHub OAuth for browser login. That doesn't affect the AP
 
 - `just check` runs clippy with `-W clippy::pedantic`; keep it clean. Format with `cargo fmt`.
 - Edition 2024, GPL-3.0 SPDX headers, one-line doc comments on functions.
+
+## macOS app (`macos/`)
+
+A SwiftUI and AppKit port, built as a Swift package with no dependencies. `make` drives it (`just` isn't installed on the Mac). `make test` runs swift-testing; `make app` builds `build/Deploy Sidebar.app` and signs it ad hoc.
+
+- `Sources/DeploySidebarCore` has no UI: `Config`, `TOML`, `Render`, `Grafana`, `Health`, `Keychain`, and `SidebarModel`, the port of `app.rs`'s state machine (`deployFetched`, `startWatch`, `sweep`). When deploy behaviour changes on one side, change the other to match.
+- `Sources/DeploySidebar` holds `Main` (CLI dispatch, then the SwiftUI `App` with a `MenuBarExtra`), `AppDelegate`, `SidebarPanel`, `SidebarView`, `SettingsModel`/`SettingsView`, `CLI` and `LoginItem`.
+- It uses the same config path and TOML format as Linux. `TOML.swift` is a hand-written parser for the subset the config needs, and `toTOML()` writes the file back.
+- `ExampleConfig.swift` is generated from `../config.example.toml` by `make example`. `ConfigTests` fails if the two drift.
+- Keychain service `io.orta.DeploySidebar`, accounts `grafana_token` / `render_api_key`. The Render key falls back to `io.orta.RenderVercelDeploy`, the menu bar app in `../render-vercel-deploy-info`. Ad-hoc signing means the Keychain prompts again after each rebuild; `SIGN_IDENTITY` overrides it. The identities on this Mac belong to Ben Maslen and Puzzmo Inc., so don't pick one without asking.
+- `SidebarModel.clock` is injectable, and tests use it to step through the window and fade. Models built by `init(setup:)` never read the real config file.
+
+### macOS gotchas
+
+- The sidebar is a borderless `.nonactivatingPanel` `NSPanel` at `.floating` level. `SidebarHostingView` overrides `acceptsFirstMouse`, so links work on the first click without stealing focus.
+- Unlike COSMIC, the panel sizes itself from SwiftUI: `onGeometryChange` reports the content size and `SidebarPanel.place` keeps the top right corner pinned. There is no `content_height()` estimate to maintain.
+- Fading animates the window's `alphaValue`, so the COSMIC `Palette` alpha trick isn't needed; system colours are fine.
+- A process started from a terminal can't take activation with `NSApp.activate()`, so the settings-only launch uses `activate(ignoringOtherApps:)`.
+- SwiftUI's `App` already provides an Edit menu, so Cmd-V works in an accessory app. `installEditMenuIfNeeded` is a fallback.
+
+### Testing the macOS app visually
+
+- One built-in Retina screen, 1512x982 points (3024x1964 px). The panel sits at x 1120-1500, y 50.
+- **Don't take full-screen screenshots**, because they capture the user's other apps. Find the app's window IDs with `CGWindowListCopyWindowInfo` (the panel is layer 3) and capture just that window with `screencapture -x -o -l <id>`.
+- `make demo` runs in the foreground until quit, so background it and `pkill -f 'DeploySidebar --demo'` after capturing. Point `XDG_CONFIG_HOME` at a scratch directory to test config states without touching `~/.config`.

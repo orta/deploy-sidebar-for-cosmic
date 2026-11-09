@@ -19,3 +19,7 @@ builddir/
 repo/
 .flatpak-builder/
 flatpak-cargo-generator.py
+# macOS app build output
+macos/.build/
+macos/build/
+.DS_Store

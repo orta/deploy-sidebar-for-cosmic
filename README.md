@@ -4,6 +4,8 @@ A sidebar for the COSMIC desktop. It appears in the top right when a watched Ren
 
 It sits alongside [cosmic-deploys](https://github.com/orta/cosmic-deploys), the panel applet, and reads the Render key that applet stores in the keyring.
 
+There is also a native macOS version, written in SwiftUI, in [`macos/`](macos/). See [macOS](#macos) below.
+
 ## How it works
 
 - Every 20s it fetches the newest deploy of each configured service from the Render API.
@@ -37,3 +39,26 @@ just logs
 ```
 
 Only the `datasource_uid`, `grafana_url` and service IDs are Puzzmo-specific. The metrics are just PromQL in the config file.
+
+## macOS
+
+The `macos/` folder is a SwiftUI and AppKit version of the same app. It reads the same config file at `~/.config/cosmic-deploy-sidebar/config.toml`, so one config works on both machines. It needs macOS 14 or later and the Xcode command line tools.
+
+```bash
+cd macos
+make install    # builds "Deploy Sidebar.app" into ~/Applications and starts it
+```
+
+It runs as a menu bar app: the pulse icon opens a menu with **Settings…**, **Preview Latest Deploy** for each service, and **Quit**. The settings window is the same as on COSMIC, plus an **Open at login** switch. The sidebar floats at the top right of the screen the pointer is on, and never takes focus.
+
+- Tokens are stored in the login Keychain under `io.orta.DeploySidebar`. With no Render key set, it uses the one the RenderVercelDeploy menu bar app saved (`io.orta.RenderVercelDeploy`). `GRAFANA_TOKEN` and `RENDER_API_KEY` also work.
+- The app is signed ad hoc, so the Keychain asks again after each rebuild. Choose **Always Allow**, or build with a stable identity: `make install SIGN_IDENTITY="Apple Development: …"`.
+- The CLI subcommands are the same, run from the binary inside the bundle: `~/Applications/Deploy\ Sidebar.app/Contents/MacOS/DeploySidebar check`.
+
+```bash
+make demo       # synthetic data, no network; quit it from its menu bar icon
+make settings   # only the settings window
+make queries    # run every configured query, like `check`
+make test       # swift test
+make logs       # log stream for io.orta.DeploySidebar
+```
