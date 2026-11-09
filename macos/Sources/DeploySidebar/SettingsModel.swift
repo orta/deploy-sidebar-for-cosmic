@@ -121,6 +121,10 @@ final class SettingsModel {
             grafanaTest = .failed("Enter a URL and token first")
             return
         }
+        guard !grafana.datasourceUID.isEmpty else {
+            grafanaTest = .failed("Pick a Prometheus datasource first")
+            return
+        }
         grafanaTest = .loading
         Task {
             do {

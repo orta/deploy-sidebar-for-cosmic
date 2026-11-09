@@ -154,7 +154,7 @@ public enum Render {
         do {
             return try decoder.decode(type, from: data)
         } catch {
-            throw AppError("Unexpected Render response: \(error)")
+            throw AppError("Unexpected Render response: \(AppError.describe(error))")
         }
     }
 

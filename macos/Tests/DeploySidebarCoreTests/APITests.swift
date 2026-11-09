@@ -61,3 +61,34 @@ import Testing
     #expect(results[1] == .failure(AppError("bad expr")))
     #expect(results[2] == .failure(AppError("No result")))
 }
+
+@Test func builtInDatasourcesWithoutUIDsAreSkipped() throws {
+    let json = """
+        {"datasources": {
+          "-- Dashboard --": {"type": "datasource", "name": "-- Dashboard --", "meta": {}},
+          "-- Grafana --": {"type": "datasource", "uid": "grafana"},
+          "Prometheus": {"type": "prometheus", "uid": "abc123"},
+          "Loki": {"type": "loki", "uid": "loki1"}
+        }, "buildInfo": {}}
+        """
+    #expect(try Grafana.parseDatasources(Data(json.utf8)) == [Datasource(name: "Prometheus", uid: "abc123")])
+}
+
+@Test func wholeRequestErrorsAreShown() {
+    let json = #"{"message": "Query missing datasource info: Q0", "messageId": "", "statusCode": 400}"#
+    #expect(throws: AppError("Grafana: Query missing datasource info: Q0")) {
+        try Grafana.parseResults(Data(json.utf8), count: 1)
+    }
+}
+
+@Test func decodingErrorsAreReadable() {
+    struct Needs: Decodable { let uid: String }
+    #expect(throws: AppError("Unexpected Render response: `id` is missing at 0.deploy")) {
+        _ = try Render.parseLatestDeploy(Data(#"[{"deploy": {}}]"#.utf8), serviceID: "s")
+    }
+    do {
+        _ = try JSONDecoder().decode([String: Needs].self, from: Data(#"{"-- Dashboard --": {}}"#.utf8))
+    } catch {
+        #expect(AppError.describe(error) == "`uid` is missing at -- Dashboard --")
+    }
+}

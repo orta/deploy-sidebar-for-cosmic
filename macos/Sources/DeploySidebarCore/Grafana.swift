@@ -74,19 +74,7 @@ public struct Grafana: Sendable {
     /// List Prometheus datasources. Uses the frontend settings, which a Viewer token can read,
     /// unlike `/api/datasources`.
     public func prometheusDatasources() async throws -> [Datasource] {
-        struct FrontendDatasource: Decodable {
-            let uid: String
-            let type: String
-        }
-        struct FrontendSettings: Decodable {
-            let datasources: [String: FrontendDatasource]?
-        }
-        let data = try await send(try request(path: "/api/frontend/settings"))
-        let settings = try Self.decode(FrontendSettings.self, from: data)
-        return (settings.datasources ?? [:])
-            .filter { $0.value.type == "prometheus" }
-            .map { Datasource(name: $0.key, uid: $0.value.uid) }
-            .sorted { $0.name < $1.name }
+        try Self.parseDatasources(try await send(try request(path: "/api/frontend/settings")))
     }
 
     /// Run a trivial query, to confirm the URL, token and datasource work together.
@@ -142,8 +130,26 @@ public struct Grafana: Sendable {
         do {
             return try JSONDecoder().decode(type, from: data)
         } catch {
-            throw AppError("Unexpected Grafana response: \(error)")
+            throw AppError("Unexpected Grafana response: \(AppError.describe(error))")
         }
+    }
+
+    /// The Prometheus datasources in `/api/frontend/settings`. Built-in entries such as
+    /// `-- Dashboard --` have no uid, so every field is optional.
+    static func parseDatasources(_ data: Data) throws -> [Datasource] {
+        struct FrontendDatasource: Decodable {
+            let uid: String?
+            let type: String?
+        }
+        struct FrontendSettings: Decodable {
+            let datasources: [String: FrontendDatasource]?
+        }
+        return (try decode(FrontendSettings.self, from: data).datasources ?? [:])
+            .compactMap { name, datasource in
+                guard datasource.type == "prometheus", let uid = datasource.uid, !uid.isEmpty else { return nil }
+                return Datasource(name: name, uid: uid)
+            }
+            .sorted { $0.name < $1.name }
     }
 
     static func refID(_ index: Int) -> String {
@@ -153,6 +159,10 @@ public struct Grafana: Sendable {
     /// Split a `/api/ds/query` response into one result per query, in refId order.
     static func parseResults(_ data: Data, count: Int) throws -> [SeriesResult] {
         let response = try decode(QueryResponse.self, from: data)
+        // A request Grafana rejects as a whole, e.g. an unknown datasource, has only a message.
+        if response.results == nil, let message = response.message {
+            throw AppError("Grafana: \(message)")
+        }
         return (0..<count).map { index in
             guard let result = response.results?[refID(index)] else {
                 return .failure(AppError("No result"))
@@ -181,6 +191,7 @@ public struct Grafana: Sendable {
 
     struct QueryResponse: Decodable {
         let results: [String: QueryResult]?
+        let message: String?
     }
 
     struct QueryResult: Decodable {
