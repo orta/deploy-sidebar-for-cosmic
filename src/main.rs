@@ -7,6 +7,7 @@ mod config;
 mod grafana;
 mod health;
 mod keyring;
+mod placement;
 mod render;
 mod settings;
 

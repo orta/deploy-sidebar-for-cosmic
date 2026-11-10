@@ -45,6 +45,8 @@ pub struct SettingsApp {
     window_minutes: String,
     baseline_minutes: String,
     floors: Vec<Vec<String>>,
+    /// Each service's repo clones as typed, comma separated.
+    repos: Vec<String>,
 
     grafana_token_input: String,
     has_grafana_token: bool,
@@ -84,6 +86,9 @@ pub enum Message {
     RenderServiceId(usize, String),
     AddService,
     RemoveService(usize),
+    ServiceRepos(usize, String),
+    ServiceRepoPath(usize, String),
+    ServiceDashboard(usize, String),
     TestService(usize),
     ServiceTested(usize, Result<Vec<SeriesResult>, String>),
 
@@ -92,6 +97,7 @@ pub enum Message {
     MetricUnit(usize, usize, usize),
     MetricWorse(usize, usize, usize),
     MetricFloor(usize, usize, String),
+    MetricBreakdown(usize, usize, String),
     AddMetric(usize),
     RemoveMetric(usize, usize),
 
@@ -131,6 +137,7 @@ impl cosmic::Application for SettingsApp {
             window_minutes: config.window_minutes.to_string(),
             baseline_minutes: config.baseline_minutes.to_string(),
             floors: floor_inputs(&config),
+            repos: config.services.iter().map(|s| s.repos.join(", ")).collect(),
             config,
             grafana_token_input: String::new(),
             has_grafana_token,
@@ -300,15 +307,33 @@ impl cosmic::Application for SettingsApp {
                     metrics: Vec::new(),
                     repos: Vec::new(),
                     repo_path: None,
+                    grafana_dashboard: None,
                 });
                 self.floors.push(Vec::new());
+                self.repos.push(String::new());
             }
             Message::RemoveService(index) => {
                 if index < self.config.services.len() {
                     self.config.services.remove(index);
                     self.floors.remove(index);
+                    self.repos.remove(index);
                     // Test results are keyed by position, which just shifted.
                     self.service_tests.clear();
+                }
+            }
+            Message::ServiceRepos(index, text) => {
+                if let Some(repos) = self.repos.get_mut(index) {
+                    *repos = text;
+                }
+            }
+            Message::ServiceRepoPath(index, path) => {
+                if let Some(service) = self.config.services.get_mut(index) {
+                    service.repo_path = non_empty(path);
+                }
+            }
+            Message::ServiceDashboard(index, url) => {
+                if let Some(service) = self.config.services.get_mut(index) {
+                    service.grafana_dashboard = non_empty(url);
                 }
             }
             Message::TestService(index) => return self.test_service(index),
@@ -346,6 +371,11 @@ impl cosmic::Application for SettingsApp {
                     *floor = text;
                 }
             }
+            Message::MetricBreakdown(s, m, expr) => {
+                if let Some(metric) = self.metric_mut(s, m) {
+                    metric.breakdown = non_empty(expr);
+                }
+            }
             Message::AddMetric(s) => {
                 if let Some(service) = self.config.services.get_mut(s) {
                     service.metrics.push(Metric {
@@ -354,6 +384,7 @@ impl cosmic::Application for SettingsApp {
                         unit: Unit::Count,
                         worse: Direction::Higher,
                         floor: 0.0,
+                        breakdown: None,
                     });
                     self.floors[s].push("0".into());
                     self.service_tests.remove(&s);
@@ -568,6 +599,7 @@ impl SettingsApp {
                     .width(Length::Fixed(260.0)),
             ))
             .add(widget::settings::item("Render service", render_picker));
+        section = self.service_links(index, service, section);
 
         for (m, metric) in service.metrics.iter().enumerate() {
             let result = match tests {
@@ -618,6 +650,46 @@ impl SettingsApp {
             .into()
     }
 
+    /// The optional per-service fields: dashboard link, repo clones and folder.
+    fn service_links<'a>(
+        &'a self,
+        index: usize,
+        service: &'a Service,
+        section: widget::settings::Section<'a, Message>,
+    ) -> widget::settings::Section<'a, Message> {
+        section
+            .add(widget::settings::item(
+                "Grafana dashboard",
+                widget::text_input(
+                    "Optional, e.g. /d/abc123/my-service",
+                    service.grafana_dashboard.as_deref().unwrap_or(""),
+                )
+                .on_input(move |url| Message::ServiceDashboard(index, url))
+                .width(Length::Fixed(260.0)),
+            ))
+            .add(
+                widget::settings::item::builder("Repo clones")
+                    .description("Claude writes a testing checklist in whichever has the deploy")
+                    .control(
+                        widget::text_input(
+                            "Optional, e.g. ~/dev/app, ~/dev/app-2",
+                            self.repos.get(index).map_or("", String::as_str),
+                        )
+                        .on_input(move |text| Message::ServiceRepos(index, text))
+                        .width(Length::Fixed(260.0)),
+                    ),
+            )
+            .add(widget::settings::item(
+                "Folder in the repo",
+                widget::text_input(
+                    "Optional, e.g. apps/api",
+                    service.repo_path.as_deref().unwrap_or(""),
+                )
+                .on_input(move |path| Message::ServiceRepoPath(index, path))
+                .width(Length::Fixed(260.0)),
+            ))
+    }
+
     fn metric_editor<'a>(
         &'a self,
         s: usize,
@@ -661,12 +733,19 @@ impl SettingsApp {
                     .on_press(Message::RemoveMetric(s, m)),
             );
 
-        let mut column = widget::column::with_capacity(3)
+        let mut column = widget::column::with_capacity(4)
             .spacing(space.space_xxs)
             .push(top)
             .push(
                 widget::text_input("PromQL, e.g. sum(rate(…[2m]))", &metric.expr)
                     .on_input(move |expr| Message::MetricExpr(s, m, expr)),
+            )
+            .push(
+                widget::text_input(
+                    "Optional breakdown, the same query split by a label, e.g. sum by (route) (…)",
+                    metric.breakdown.as_deref().unwrap_or(""),
+                )
+                .on_input(move |expr| Message::MetricBreakdown(s, m, expr)),
             );
         if let Some(result) = result {
             column = column.push(widget::text::caption(result));
@@ -750,6 +829,12 @@ impl SettingsApp {
         config.window_minutes = parse_minutes(&self.window_minutes, "Minutes to show")?;
         config.baseline_minutes = parse_minutes(&self.baseline_minutes, "Baseline minutes")?;
         for (s, service) in config.services.iter_mut().enumerate() {
+            service.repos = self.repos[s]
+                .split(',')
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(String::from)
+                .collect();
             for (m, metric) in service.metrics.iter_mut().enumerate() {
                 let text = self.floors[s][m].trim();
                 metric.floor = if text.is_empty() {
@@ -789,6 +874,18 @@ fn floor_inputs(config: &Config) -> Vec<Vec<String>> {
         .iter()
         .map(|s| s.metrics.iter().map(|m| m.floor.to_string()).collect())
         .collect()
+}
+
+/// A trimmed field, or `None` when it was left blank.
+fn non_empty(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else if trimmed.len() == text.len() {
+        Some(text)
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn parse_minutes(text: &str, field: &str) -> Result<i64, String> {

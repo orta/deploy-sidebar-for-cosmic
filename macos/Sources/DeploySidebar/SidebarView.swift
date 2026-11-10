@@ -71,7 +71,7 @@ private struct WatchCard: View {
                 Spacer(minLength: 4)
                 Text(status.text)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.primary)
                     .monospacedDigit()
                 Button {
                     model.dismiss(watch.deploy.id)

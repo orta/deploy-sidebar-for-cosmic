@@ -8,9 +8,10 @@ A COSMIC desktop sidebar that appears when a watched Render service deploys, sho
 - `src/render.rs` - Render API, latest deploy per service
 - `src/grafana.rs` - PromQL through Grafana's `/api/ds/query`; multi-series results are summed per timestamp
 - `src/checklist.rs` - when a service lists `repos`, each new deploy runs a read-only `claude -p --json-schema` in the clone that best matches the deployed commit (has `prev..new`, has it checked out, clean, fewest commits past it). The range comes from `render::previous_commit`. Started when the deploy is first seen, kept across Building -> Live, aborted via an iced `Handle` (plus `kill_on_drop`) when the watch is dropped. Unticked items hold the card past its window. `cosmic-deploy-sidebar checklist <service>` runs it from the terminal
-- `src/health.rs` - baseline comparison (`assess`), value formatting
+- `src/health.rs` - baseline comparison (`assess`), value formatting `worst_series` ranks a metric's optional `breakdown` query (split by e.g. `route`); the app fetches it via `Grafana::query_labelled` only while that metric is Warn or worse.
 - `src/config.rs` + `config.example.toml` - TOML config at `~/.config/cosmic-deploy-sidebar/config.toml`; the example is embedded and used by `init-config` and `--demo`
 - `src/settings.rs` - the settings window (`cosmic-deploy-sidebar settings`), a normal libcosmic app with a main window, run as its own process. It saves the TOML config and keyring entries; the sidebar polls the config mtime every 3s and reloads (`App::reload_if_changed`), keeping watches unless the service IDs changed
+- `src/placement.rs` - the corner and output (connector name) the sidebar was dragged to, saved in `$XDG_STATE_HOME/cosmic-deploy-sidebar/placement.toml`, not the config, so the settings window can't overwrite it
 - `src/cli.rs` - setup subcommands (`init-config`, `set-grafana-token`, `list-services`, `check`, ...)
 - `src/keyring.rs` - Secret Service; falls back to the cosmic-deploys applet's Render key (`com.github.orta.cosmic-deploys` / `render_api_key`)
 
@@ -26,6 +27,8 @@ Puzzmo's Grafana uses GitHub OAuth for browser login. That doesn't affect the AP
 
 - **Layer surface autosize does not work**: `size: None` in `SctkLayerSurfaceSettings` leaves the surface unmapped, and nothing appears. Pass an explicit size. `content_height()` estimates the layout height and `sync_surface()` calls `set_size` when it changes. If you change spacing or rows in the view, update `content_height()` to match.
 - Layer surface commands live at `cosmic::iced_winit::commands::layer_surface`, settings at `cosmic::iced_runtime::platform_specific::wayland::layer_surface`.
+- Hovering a card (`mouse_area` `on_enter`/`on_exit`) adds a row of link pills and holds it open, so `content_height()` counts `LINKS_HEIGHT` for the hovered card and a row per breakdown series. Hover can't be scripted; for a screenshot, temporarily set `hovered` in `App::demo`.
+- **Dragging**: layer surfaces can't be moved interactively. A press on the sidebar's background (status `Ignored`, so links and checkboxes don't count) followed by a 6px move opens a transparent `Layer::Overlay` surface on every output (all anchors, `exclusive_zone: -1`). While the button is held the sidebar keeps the pointer (an implicit grab), so the target corner is estimated from sidebar-local coordinates. After release, the pointer enters an overlay, which gives the exact output and corner; `DROP_WAIT` falls back to the estimate. The sidebar is then destroyed and recreated with the new anchor and `IcedOutput::Output`. Outputs come from the wayland `Output` events in `listen_with`; `IcedOutput::All` is a TODO in iced, so it can't be used.
 - The app runs with `no_main_window(true)`; everything renders through `view_window`.
 - iced has no whole-surface opacity, so the fade multiplies the alpha of every colour via `Palette::new(alpha)`. New widgets must take their colours from `Palette` or they won't fade. That's why the close control is a text link rather than an icon button.
 - The view is only rebuilt after a message, so animation needs the 33ms `Frame` subscription. Don't gate the `Tick`/`Frame` subscriptions behind config being present; that bug once froze the setup notice partly transparent.
@@ -64,7 +67,7 @@ Puzzmo's Grafana uses GitHub OAuth for browser login. That doesn't affect the AP
 
 A SwiftUI and AppKit port, built as a Swift package with no dependencies. `make` drives it (`just` isn't installed on the Mac). `make test` runs swift-testing; `make app` builds `build/Deploy Sidebar.app` and signs it ad hoc.
 
-- `Sources/DeploySidebarCore` has no UI: `Config`, `TOML`, `Render`, `Grafana`, `Health`, `Keychain`, and `SidebarModel`, the port of `app.rs`'s state machine (`deployFetched`, `startWatch`, `sweep`). When deploy behaviour changes on one side, change the other to match.
+- `Sources/DeploySidebarCore` has no UI: `Config`, `TOML`, `Render`, `Grafana`, `Health`, `Keychain`, and `SidebarModel`, the port of `app.rs`'s state machine (`deployFetched`, `startWatch`, `sweep`). When deploy behaviour or the sidebar's UI changes on one side, change the other to match.
 - `Sources/DeploySidebar` holds `Main` (CLI dispatch, then the SwiftUI `App` with a `MenuBarExtra`), `AppDelegate`, `SidebarPanel`, `SidebarView`, `SettingsModel`/`SettingsView`, `CLI` and `LoginItem`.
 - It uses the same config path and TOML format as Linux. `TOML.swift` is a hand-written parser for the subset the config needs, and `toTOML()` writes the file back.
 - `ExampleConfig.swift` is generated from `../config.example.toml` by `make example`. `ConfigTests` fails if the two drift.
@@ -74,7 +77,8 @@ A SwiftUI and AppKit port, built as a Swift package with no dependencies. `make`
 ### macOS gotchas
 
 - The sidebar is a borderless `.nonactivatingPanel` `NSPanel` at `.floating` level. `SidebarHostingView` overrides `acceptsFirstMouse`, so links work on the first click without stealing focus.
-- Unlike COSMIC, the panel sizes itself from SwiftUI: `onGeometryChange` reports the content size and `SidebarPanel.place` keeps the top right corner pinned. There is no `content_height()` estimate to maintain.
+- Unlike COSMIC, the panel sizes itself from SwiftUI: `onGeometryChange` reports the content size and `SidebarPanel.place` keeps the saved corner pinned. There is no `content_height()` estimate to maintain.
+- Dragging: a local `NSEvent` monitor moves the panel with the pointer once a press on it travels 6pt, swallowing the drag events. On release it snaps to the nearest corner of the screen under the pointer and saves a `Placement` (same `placement.toml` as Linux, screen keyed by `localizedName`). The release is redelivered far outside the panel so a button the drag started on doesn't fire. Unlike COSMIC, a drag can start on a link.
 - Fading animates the window's `alphaValue`, so the COSMIC `Palette` alpha trick isn't needed; system colours are fine.
 - A process started from a terminal can't take activation with `NSApp.activate()`, so the settings-only launch uses `activate(ignoringOtherApps:)`.
 - SwiftUI's `App` already provides an Edit menu, so Cmd-V works in an accessory app. `installEditMenuIfNeeded` is a fallback.

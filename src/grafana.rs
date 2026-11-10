@@ -28,6 +28,9 @@ pub struct Grafana {
 /// One query's result: points sorted by time, or why it failed.
 pub type SeriesResult = Result<Vec<(DateTime<Utc>, f64)>, String>;
 
+/// Each series of a query kept apart, named by its label values (e.g. "POST /graphql").
+pub type Labelled = Vec<(String, Vec<(DateTime<Utc>, f64)>)>;
+
 #[derive(Deserialize)]
 struct Response {
     #[serde(default)]
@@ -43,7 +46,21 @@ struct QueryResult {
 
 #[derive(Deserialize)]
 struct Frame {
+    #[serde(default)]
+    schema: Option<Schema>,
     data: FrameData,
+}
+
+#[derive(Deserialize)]
+struct Schema {
+    #[serde(default)]
+    fields: Vec<Field>,
+}
+
+#[derive(Deserialize)]
+struct Field {
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +78,45 @@ impl Grafana {
         to: DateTime<Utc>,
         step: Duration,
     ) -> Result<Vec<SeriesResult>, String> {
+        let response = self.post_queries(exprs, from, to, step).await?;
+        Ok((0..exprs.len())
+            .map(|i| match response.results.get(&ref_id(i)) {
+                None => Err("No result".to_string()),
+                Some(QueryResult {
+                    error: Some(error), ..
+                }) => Err(error.clone()),
+                Some(result) => Ok(merge_frames(&result.frames)),
+            })
+            .collect())
+    }
+
+    /// Run one expression over `from..to`, keeping each series and its labels.
+    pub async fn query_labelled(
+        &self,
+        expr: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        step: Duration,
+    ) -> Result<Labelled, String> {
+        let response = self
+            .post_queries(&[expr.to_string()], from, to, step)
+            .await?;
+        match response.results.get(&ref_id(0)) {
+            None => Err("No result".to_string()),
+            Some(QueryResult {
+                error: Some(error), ..
+            }) => Err(error.clone()),
+            Some(result) => Ok(result.frames.iter().map(labelled_frame).collect()),
+        }
+    }
+
+    async fn post_queries(
+        &self,
+        exprs: &[String],
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        step: Duration,
+    ) -> Result<Response, String> {
         let step_ms = u64::try_from(step.as_millis()).unwrap_or(60_000);
         let queries: Vec<Value> = exprs
             .iter()
@@ -97,17 +153,7 @@ impl Grafana {
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(format!("Grafana rejected the token ({status})"));
         }
-        let response: Response = json_or_explain(response).await?;
-
-        Ok((0..exprs.len())
-            .map(|i| match response.results.get(&ref_id(i)) {
-                None => Err("No result".to_string()),
-                Some(QueryResult {
-                    error: Some(error), ..
-                }) => Err(error.clone()),
-                Some(result) => Ok(merge_frames(&result.frames)),
-            })
-            .collect())
+        json_or_explain(response).await
     }
 }
 
@@ -203,6 +249,18 @@ fn ref_id(index: usize) -> String {
     format!("Q{index}")
 }
 
+/// A frame's points, named by its value field's labels joined in key order.
+fn labelled_frame(frame: &Frame) -> (String, Vec<(DateTime<Utc>, f64)>) {
+    let name = frame
+        .schema
+        .as_ref()
+        .and_then(|s| s.fields.get(1))
+        .and_then(|f| f.labels.as_ref())
+        .map(|labels| labels.values().cloned().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    (name, merge_frames(std::slice::from_ref(frame)))
+}
+
 /// Sum every frame's values per timestamp, so a query returning several series still plots as one.
 fn merge_frames(frames: &[Frame]) -> Vec<(DateTime<Utc>, f64)> {
     let mut points: BTreeMap<i64, f64> = BTreeMap::new();
@@ -246,5 +304,20 @@ mod tests {
         let values: Vec<f64> = points.iter().map(|(_, v)| *v).collect();
         assert_eq!(values, vec![1.5, 2.0, 3.0]);
         assert_eq!(response.results["Q1"].error.as_deref(), Some("bad expr"));
+    }
+
+    #[test]
+    fn labelled_frames_are_named_by_label_values() {
+        let frame: Frame = serde_json::from_value(json!({
+            "schema": { "fields": [
+                { "name": "Time" },
+                { "name": "Value", "labels": { "route": "/graphql", "method": "POST" } }
+            ]},
+            "data": { "values": [[1000], [0.25]] }
+        }))
+        .unwrap();
+        let (name, points) = labelled_frame(&frame);
+        assert_eq!(name, "POST /graphql");
+        assert_eq!(points.len(), 1);
     }
 }

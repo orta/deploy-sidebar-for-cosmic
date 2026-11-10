@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0
 
-//! The sidebar: idle until a watched service deploys, then a layer surface pinned to the top
-//! right showing each metric against its pre-deploy baseline, fading out once the window ends.
+//! The sidebar: idle until a watched service deploys, then a layer surface pinned to a screen
+//! corner showing each metric against its pre-deploy baseline, fading out once the window ends.
+//! Dragging it opens a drop target overlay on every output and re-anchors it where it lands.
 
 use crate::checklist::Checklist;
 use crate::config::{self, Config};
 use crate::grafana::{Grafana, SeriesResult};
-use crate::health::{self, Level};
+use crate::health::{self, Level, SeriesChange};
 use crate::keyring;
+use crate::placement::{self, Corner, Placement};
 use crate::render::{self, Deploy, DeployStatus};
 use chrono::{DateTime, TimeDelta, Utc};
+use cosmic::cctk::sctk::reexports::client::protocol::wl_output::WlOutput;
+use cosmic::iced::event::{self, PlatformSpecific, wayland};
 use cosmic::iced::window::Id;
-use cosmic::iced::{Alignment, Color, Length, Limits, Subscription};
+use cosmic::iced::{Alignment, Color, Length, Limits, Point, Subscription, mouse};
 use cosmic::iced_runtime::platform_specific::wayland::layer_surface::{
-    IcedMargin, SctkLayerSurfaceSettings,
+    IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
 };
 use cosmic::iced_winit::commands::layer_surface::{
     Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface, set_size,
@@ -26,6 +30,12 @@ use std::time::{Duration, Instant};
 
 const WIDTH: f32 = 380.0;
 const WIDTH_PX: u32 = 380;
+/// The gap between the sidebar and the screen edges.
+const MARGIN: i32 = 12;
+/// How far the pointer moves with the button down before it counts as a drag.
+const DRAG_THRESHOLD: f32 = 6.0;
+/// How long to wait after a drop for the pointer to land on an overlay, before using the estimate.
+const DROP_WAIT: Duration = Duration::from_millis(400);
 const FADE_IN: Duration = Duration::from_millis(250);
 const FADE_OUT: Duration = Duration::from_secs(3);
 /// How much history before the deploy the sparklines include, so the restart is visible.
@@ -33,6 +43,10 @@ const LEAD_IN: TimeDelta = TimeDelta::minutes(5);
 const STEP: Duration = Duration::from_mins(1);
 const SPARK_BARS: usize = 16;
 const SPARK_HEIGHT: f32 = 18.0;
+/// The most series listed under a metric that looks off.
+const MAX_BREAKDOWN: usize = 2;
+/// How far back the current value of each breakdown series is read from.
+const BREAKDOWN_RECENT: TimeDelta = TimeDelta::minutes(5);
 
 pub struct Flags {
     /// Show the sidebar now for this service's latest deploy, as if it just went live.
@@ -65,6 +79,8 @@ struct Watch {
     checklist: ChecklistState,
     /// Aborts the `claude -p` run when the watch is dropped.
     checklist_task: Option<cosmic::iced::task::Handle>,
+    /// Per metric index, the breakdown series that got worse, while the metric looks off.
+    breakdowns: HashMap<usize, Vec<SeriesChange>>,
 }
 
 /// The testing checklist Claude writes for a deploy, when the service lists repo clones.
@@ -95,6 +111,72 @@ impl ChecklistState {
     }
 }
 
+/// A connected screen, as reported by the compositor.
+#[derive(Debug, Clone)]
+pub struct Output {
+    wl: WlOutput,
+    /// The connector name, e.g. `DP-1`, which is what gets saved.
+    name: Option<String>,
+    position: (i32, i32),
+    size: (i32, i32),
+}
+
+impl Output {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        #[allow(clippy::cast_precision_loss)]
+        let (left, top, w, h) = (
+            self.position.0 as f32,
+            self.position.1 as f32,
+            self.size.0 as f32,
+            self.size.1 as f32,
+        );
+        x >= left && x < left + w && y >= top && y < top + h
+    }
+
+    /// The corner nearest a point given in global coordinates.
+    fn corner_at(&self, x: f32, y: f32) -> Corner {
+        #[allow(clippy::cast_precision_loss)]
+        Corner::nearest(
+            x - self.position.0 as f32,
+            y - self.position.1 as f32,
+            self.size.0 as f32,
+            self.size.1 as f32,
+        )
+    }
+}
+
+/// Moving the sidebar to another corner.
+enum Drag {
+    Idle,
+    /// The button went down on the sidebar's background at this surface-local point.
+    Pressed(Point),
+    /// Moved far enough: a drop target overlay is open on every output.
+    Moving {
+        /// Overlay surface per output, by index into `App::outputs`.
+        overlays: Vec<(Id, usize)>,
+        /// The output index and corner it would land in.
+        target: Option<(usize, Corner)>,
+        /// The button is up; waiting for the pointer to enter an overlay for an exact spot.
+        released: bool,
+    },
+}
+
+/// What the pointer did, on which surface.
+#[derive(Debug, Clone, Copy)]
+pub enum Pointer {
+    Moved(Point),
+    Pressed,
+    Released,
+    Left,
+}
+
+#[derive(Debug, Clone)]
+pub enum OutputChange {
+    /// Added or changed.
+    Info(Output),
+    Removed(WlOutput),
+}
+
 pub struct App {
     core: cosmic::Core,
     config: Option<Config>,
@@ -112,6 +194,15 @@ pub struct App {
     surface_height: u32,
     shown_at: Instant,
     fade_started: Option<Instant>,
+    /// The deploy whose card the pointer is over, which shows its links and holds it open.
+    hovered: Option<String>,
+    placement: Placement,
+    /// The output name the current surface was opened on; `None` for the focused output.
+    surface_output: Option<String>,
+    outputs: Vec<Output>,
+    /// Where the pointer is over the sidebar, in surface coordinates.
+    cursor: Option<Point>,
+    drag: Drag,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +230,16 @@ pub enum Message {
         result: Result<Checklist, String>,
     },
     ToggleTodo(String, usize),
+    BreakdownFetched {
+        deploy_id: String,
+        metric: usize,
+        result: Result<Vec<SeriesChange>, String>,
+    },
+    Hover(String),
+    Unhover(String),
+    Pointer(Id, Pointer),
+    Output(OutputChange),
+    DropTimeout,
 }
 
 impl cosmic::Application for App {
@@ -175,6 +276,12 @@ impl cosmic::Application for App {
             surface_height: 0,
             shown_at: Instant::now(),
             fade_started: None,
+            hovered: None,
+            placement: placement::load(),
+            surface_output: None,
+            outputs: Vec::new(),
+            cursor: None,
+            drag: Drag::Idle,
         };
         let surface = app.sync_surface();
         (
@@ -187,7 +294,14 @@ impl cosmic::Application for App {
         widget::Space::new(0, 0).into()
     }
 
-    fn view_window(&self, _id: Id) -> Element<'_, Message> {
+    fn view_window(&self, id: Id) -> Element<'_, Message> {
+        if let Drag::Moving {
+            overlays, target, ..
+        } = &self.drag
+            && let Some((_, output)) = overlays.iter().find(|(o, _)| *o == id)
+        {
+            return self.drop_overlay(*output, *target);
+        }
         let alpha = self.alpha();
         let palette = Palette::new(alpha);
         let space = cosmic::theme::spacing();
@@ -244,6 +358,28 @@ impl cosmic::Application for App {
             subscriptions
                 .push(cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
         }
+        subscriptions.push(event::listen_with(|event, status, id| match event {
+            event::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                Some(Message::Pointer(id, Pointer::Moved(position)))
+            }
+            // Presses a link or checkbox handled are captured, so they don't start a drag.
+            event::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if status == event::Status::Ignored =>
+            {
+                Some(Message::Pointer(id, Pointer::Pressed))
+            }
+            event::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                Some(Message::Pointer(id, Pointer::Released))
+            }
+            event::Event::Mouse(mouse::Event::CursorLeft) => {
+                Some(Message::Pointer(id, Pointer::Left))
+            }
+            event::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Output(
+                change,
+                wl,
+            ))) => output_change(change, wl).map(Message::Output),
+            _ => None,
+        }));
         if self.is_animating() {
             subscriptions
                 .push(cosmic::iced::time::every(Duration::from_millis(33)).map(|_| Message::Frame));
@@ -285,7 +421,8 @@ impl cosmic::Application for App {
                     Err(e) => watch.error = Some(e),
                 }
                 self.reopen_if_regressed(&deploy_id);
-                return self.sync_surface();
+                let breakdowns = self.fetch_breakdowns(&deploy_id);
+                return Task::batch([self.sync_surface(), breakdowns]);
             }
             Message::Tick => return self.sweep(),
             Message::Frame => {
@@ -322,21 +459,18 @@ impl cosmic::Application for App {
                 let _ = open::that_detached(url);
             }
             Message::ChecklistFetched { deploy_id, result } => {
-                if let Some(watch) = self.watches.iter_mut().find(|w| w.deploy.id == deploy_id) {
-                    watch.checklist_task = None;
-                    watch.checklist = match result {
-                        Ok(checklist) => {
-                            let done = vec![false; checklist.items.len()];
-                            ChecklistState::Ready(checklist, done)
-                        }
-                        Err(e) => {
-                            eprintln!("Checklist: {e}");
-                            ChecklistState::Failed(e)
-                        }
-                    };
-                }
-                return self.sync_surface();
+                return self.checklist_fetched(&deploy_id, result);
             }
+            Message::BreakdownFetched {
+                deploy_id,
+                metric,
+                result,
+            } => return self.breakdown_fetched(&deploy_id, metric, result),
+            Message::Hover(deploy_id) => return self.hover(deploy_id, true),
+            Message::Unhover(deploy_id) => return self.hover(deploy_id, false),
+            Message::Pointer(id, pointer) => return self.pointer(id, pointer),
+            Message::Output(change) => return self.output_changed(change),
+            Message::DropTimeout => return self.drop_timeout(),
             Message::ToggleTodo(deploy_id, index) => {
                 if let Some(ChecklistState::Ready(_, done)) = self
                     .watches
@@ -443,19 +577,9 @@ impl App {
                     error: None,
                     dismissed: false,
                     dismissed_while_bad: false,
-                    checklist: ChecklistState::Ready(
-                        Checklist {
-                            clone: "app2".into(),
-                            items: vec![
-                                "Open a calendar playlist and play a puzzle".into(),
-                                "Reorder a playlist and check it saves".into(),
-                                "Load the calendar logged out".into(),
-                            ],
-                            note: None,
-                        },
-                        vec![true, false, false],
-                    ),
+                    checklist: demo_checklist(),
                     checklist_task: None,
+                    breakdowns: demo_breakdowns(),
                 },
                 Watch {
                     service: 1,
@@ -473,6 +597,7 @@ impl App {
                     dismissed_while_bad: false,
                     checklist: ChecklistState::Pending,
                     checklist_task: None,
+                    breakdowns: HashMap::new(),
                 },
             ],
             notice: None,
@@ -480,6 +605,12 @@ impl App {
             surface_height: 0,
             shown_at: Instant::now(),
             fade_started: None,
+            hovered: None,
+            placement: placement::load(),
+            surface_output: None,
+            outputs: Vec::new(),
+            cursor: None,
+            drag: Drag::Idle,
         };
         let surface = app.sync_surface();
         (app, surface)
@@ -584,6 +715,7 @@ impl App {
             dismissed_while_bad: false,
             checklist,
             checklist_task,
+            breakdowns: HashMap::new(),
         });
         self.watches.sort_by_key(|w| w.service);
         self.fade_started = None;
@@ -627,6 +759,161 @@ impl App {
         })
         .abortable();
         Some((task, handle.abort_on_drop()))
+    }
+
+    /// Track the card under the pointer, which grows to show its links.
+    fn hover(&mut self, deploy_id: String, entered: bool) -> Task<cosmic::Action<Message>> {
+        if entered {
+            self.hovered = Some(deploy_id);
+            self.fade_started = None;
+        } else if self.hovered.as_deref() == Some(deploy_id.as_str()) {
+            self.hovered = None;
+        }
+        self.sync_surface()
+    }
+
+    /// Store a breakdown, dropping it when nothing in it got worse.
+    fn breakdown_fetched(
+        &mut self,
+        deploy_id: &str,
+        metric: usize,
+        result: Result<Vec<SeriesChange>, String>,
+    ) -> Task<cosmic::Action<Message>> {
+        if let Some(watch) = self.watches.iter_mut().find(|w| w.deploy.id == deploy_id) {
+            match result {
+                Ok(changes) if !changes.is_empty() => {
+                    watch.breakdowns.insert(metric, changes);
+                }
+                Ok(_) => {
+                    watch.breakdowns.remove(&metric);
+                }
+                Err(e) => eprintln!("Breakdown: {e}"),
+            }
+        }
+        self.sync_surface()
+    }
+
+    /// Store Claude's checklist, or why there isn't one.
+    fn checklist_fetched(
+        &mut self,
+        deploy_id: &str,
+        result: Result<Checklist, String>,
+    ) -> Task<cosmic::Action<Message>> {
+        if let Some(watch) = self.watches.iter_mut().find(|w| w.deploy.id == deploy_id) {
+            watch.checklist_task = None;
+            watch.checklist = match result {
+                Ok(checklist) => {
+                    let done = vec![false; checklist.items.len()];
+                    ChecklistState::Ready(checklist, done)
+                }
+                Err(e) => {
+                    eprintln!("Checklist: {e}");
+                    ChecklistState::Failed(e)
+                }
+            };
+        }
+        self.sync_surface()
+    }
+
+    /// For each metric that looks off and has a breakdown query, find the series behind it.
+    fn fetch_breakdowns(&mut self, deploy_id: &str) -> Task<cosmic::Action<Message>> {
+        let (Some(grafana), Some(config)) = (self.grafana.clone(), &self.config) else {
+            return Task::none();
+        };
+        let Some(watch) = self.watches.iter_mut().find(|w| w.deploy.id == deploy_id) else {
+            return Task::none();
+        };
+        let Some(service) = config.services.get(watch.service) else {
+            return Task::none();
+        };
+        let started = watch.deploy.created_at;
+        let baseline_from = started - TimeDelta::minutes(config.baseline_minutes);
+
+        let mut tasks = Vec::new();
+        for (i, metric) in service.metrics.iter().enumerate() {
+            let current = watch
+                .series
+                .get(i)
+                .and_then(|s| s.as_ref().ok())
+                .and_then(|p| p.last())
+                .map(|(_, v)| *v);
+            let level = health::assess(metric, watch.baselines.get(i).copied().flatten(), current);
+            let Some(expr) = metric.breakdown.clone().filter(|_| level >= Level::Warn) else {
+                watch.breakdowns.remove(&i);
+                continue;
+            };
+            let metric = metric.clone();
+            let grafana = grafana.clone();
+            let deploy_id = deploy_id.to_string();
+            tasks.push(task(async move {
+                let now = Utc::now();
+                let result = async {
+                    let before = grafana
+                        .query_labelled(&expr, baseline_from, started, STEP)
+                        .await?;
+                    let after = grafana
+                        .query_labelled(&expr, now - BREAKDOWN_RECENT, now, STEP)
+                        .await?;
+                    Ok::<_, String>(health::worst_series(
+                        &metric,
+                        &before,
+                        &after,
+                        MAX_BREAKDOWN,
+                    ))
+                }
+                .await;
+                Message::BreakdownFetched {
+                    deploy_id,
+                    metric: i,
+                    result,
+                }
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    /// The service's Grafana dashboard over the baseline and the deploy, or Explore with its
+    /// metrics when no dashboard is configured.
+    fn grafana_link(&self, watch: &Watch) -> Option<String> {
+        let config = self.config.as_ref()?;
+        let service = config.services.get(watch.service)?;
+        let base = config.grafana_url.trim_end_matches('/');
+        let from = (watch.deploy.created_at - TimeDelta::minutes(config.baseline_minutes))
+            .timestamp_millis();
+        if let Some(dashboard) = service.grafana_dashboard.as_deref() {
+            let url = if dashboard.starts_with("http") {
+                dashboard.to_string()
+            } else {
+                format!("{base}/{}", dashboard.trim_start_matches('/'))
+            };
+            let separator = if url.contains('?') { '&' } else { '?' };
+            return Some(format!("{url}{separator}from={from}&to=now"));
+        }
+        let datasource = serde_json::json!({ "type": "prometheus", "uid": config.datasource_uid });
+        let queries: Vec<serde_json::Value> = service
+            .metrics
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                serde_json::json!({
+                    "refId": format!("Q{i}"),
+                    "expr": m.expr,
+                    "legendFormat": m.label,
+                    "datasource": datasource,
+                })
+            })
+            .collect();
+        let panes = serde_json::json!({ "deploy": {
+            "datasource": config.datasource_uid,
+            "queries": queries,
+            "range": { "from": from.to_string(), "to": "now" },
+        }});
+        let mut url = reqwest::Url::parse(&format!("{base}/explore")).ok()?;
+        url.query_pairs_mut()
+            .append_pair("schemaVersion", "1")
+            .append_pair("orgId", "1")
+            .append_pair("panes", &panes.to_string());
+        Some(url.into())
     }
 
     /// Query every metric for a deploy: the pre-deploy baseline, or the window around it.
@@ -678,9 +965,11 @@ impl App {
             .iter()
             .map(|s| s.metrics.as_slice())
             .collect();
+        let hovered = self.hovered.clone();
         let finished = |w: &Watch| match w.phase {
             Phase::Live(at) => {
                 now - at >= window
+                    && hovered.as_deref() != Some(w.deploy.id.as_str())
                     && worst_level(w, metrics[w.service]) < Level::Bad
                     && (w.dismissed || !w.checklist.holds())
             }
@@ -708,38 +997,369 @@ impl App {
                 self.surface_height = height;
                 set_size(id, Some(WIDTH_PX), Some(height))
             }
-            (true, None) => {
-                let id = Id::unique();
-                self.surface = Some(id);
-                self.surface_height = height;
-                self.shown_at = Instant::now();
-                self.fade_started = None;
-                get_layer_surface(SctkLayerSurfaceSettings {
-                    id,
-                    layer: Layer::Top,
-                    keyboard_interactivity: KeyboardInteractivity::None,
-                    anchor: Anchor::TOP | Anchor::RIGHT,
-                    namespace: "deploy-sidebar".into(),
-                    margin: IcedMargin {
-                        top: 12,
-                        right: 12,
-                        bottom: 0,
-                        left: 0,
-                    },
-                    // libcosmic's autosize leaves layer surfaces unmapped, so size it explicitly.
-                    size: Some((Some(WIDTH_PX), Some(height))),
-                    exclusive_zone: 0,
-                    size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
-                    ..Default::default()
-                })
-            }
+            (true, None) => self.open_surface(height),
             (false, Some(id)) => {
                 self.surface = None;
                 self.fade_started = None;
-                destroy_layer_surface(id)
+                Task::batch([destroy_layer_surface(id), self.close_overlays()])
             }
             _ => Task::none(),
         }
+    }
+
+    /// Create the sidebar's layer surface in the saved corner and output.
+    fn open_surface(&mut self, height: u32) -> Task<cosmic::Action<Message>> {
+        let id = Id::unique();
+        self.surface = Some(id);
+        self.surface_height = height;
+        self.shown_at = Instant::now();
+        self.fade_started = None;
+        self.cursor = None;
+        let output = self.saved_output();
+        self.surface_output = output.and_then(|i| self.outputs[i].name.clone());
+        let corner = self.placement.corner;
+        let (top, bottom) = if corner.is_top() {
+            (MARGIN, 0)
+        } else {
+            (0, MARGIN)
+        };
+        let (left, right) = if corner.is_left() {
+            (MARGIN, 0)
+        } else {
+            (0, MARGIN)
+        };
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            layer: Layer::Top,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            anchor: (if corner.is_top() {
+                Anchor::TOP
+            } else {
+                Anchor::BOTTOM
+            }) | (if corner.is_left() {
+                Anchor::LEFT
+            } else {
+                Anchor::RIGHT
+            }),
+            output: output.map_or(IcedOutput::Active, |i| {
+                IcedOutput::Output(self.outputs[i].wl.clone())
+            }),
+            namespace: "deploy-sidebar".into(),
+            margin: IcedMargin {
+                top,
+                right,
+                bottom,
+                left,
+            },
+            // libcosmic's autosize leaves layer surfaces unmapped, so size it explicitly.
+            size: Some((Some(WIDTH_PX), Some(height))),
+            exclusive_zone: 0,
+            size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
+            ..Default::default()
+        })
+    }
+
+    /// Close the sidebar and open it again, to move it to the saved placement.
+    fn reopen_surface(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(old) = self.surface.take() else {
+            return Task::none();
+        };
+        let height = self.content_height();
+        Task::batch([destroy_layer_surface(old), self.open_surface(height)])
+    }
+
+    /// The index of the saved output, when it is connected.
+    fn saved_output(&self) -> Option<usize> {
+        let name = self.placement.output.as_ref()?;
+        self.outputs
+            .iter()
+            .position(|o| o.name.as_ref() == Some(name))
+    }
+
+    /// The output the sidebar is on, when that is known.
+    fn current_output(&self) -> Option<usize> {
+        match &self.surface_output {
+            Some(name) => self
+                .outputs
+                .iter()
+                .position(|o| o.name.as_ref() == Some(name)),
+            // Opened on the focused output, which is only certain with one screen.
+            None if self.outputs.len() == 1 => Some(0),
+            None => None,
+        }
+    }
+
+    fn output_changed(&mut self, change: OutputChange) -> Task<cosmic::Action<Message>> {
+        // A drag's overlays refer to outputs by index, so don't shift them under it.
+        let cancel = self.close_overlays();
+        match change {
+            OutputChange::Info(output) => {
+                if let Some(existing) = self.outputs.iter_mut().find(|o| o.wl == output.wl) {
+                    *existing = output;
+                } else {
+                    self.outputs.push(output);
+                }
+                // Startup opened on the focused output before the saved one was known.
+                if self.surface.is_some()
+                    && self.surface_output.is_none()
+                    && self.saved_output().is_some()
+                {
+                    return Task::batch([cancel, self.reopen_surface()]);
+                }
+            }
+            OutputChange::Removed(wl) => {
+                let removed = self.outputs.iter().position(|o| o.wl == wl);
+                if let Some(i) = removed {
+                    let output = self.outputs.remove(i);
+                    // The compositor closes surfaces on a removed output.
+                    if self.surface.is_some()
+                        && output.name.is_some()
+                        && output.name == self.surface_output
+                    {
+                        return Task::batch([cancel, self.reopen_surface()]);
+                    }
+                }
+            }
+        }
+        cancel
+    }
+
+    fn pointer(&mut self, id: Id, pointer: Pointer) -> Task<cosmic::Action<Message>> {
+        let on_sidebar = self.surface == Some(id);
+        let overlay = match &self.drag {
+            Drag::Moving { overlays, .. } => {
+                overlays.iter().find(|(o, _)| *o == id).map(|(_, i)| *i)
+            }
+            _ => None,
+        };
+        match pointer {
+            Pointer::Moved(position) => {
+                if on_sidebar {
+                    self.cursor = Some(position);
+                }
+                match &mut self.drag {
+                    Drag::Pressed(start) if on_sidebar => {
+                        if position.distance(*start) > DRAG_THRESHOLD {
+                            return self.start_drag(position);
+                        }
+                    }
+                    Drag::Moving {
+                        target, released, ..
+                    } => {
+                        if let Some(output) = overlay {
+                            // Exact: overlays cover their whole output.
+                            let o = &self.outputs[output];
+                            #[allow(clippy::cast_precision_loss)]
+                            let corner = Corner::nearest(
+                                position.x,
+                                position.y,
+                                o.size.0 as f32,
+                                o.size.1 as f32,
+                            );
+                            *target = Some((output, corner));
+                            if *released {
+                                let target = *target;
+                                return self.finish_drag(target);
+                            }
+                        } else if on_sidebar && !*released {
+                            // The sidebar keeps the pointer while the button is held, so
+                            // estimate where that is on the desktop.
+                            let estimate = self.estimate_target(position);
+                            if let Drag::Moving { target, .. } = &mut self.drag
+                                && estimate.is_some()
+                            {
+                                *target = estimate;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Pointer::Pressed => {
+                if let (Drag::Idle, true, Some(at)) = (&self.drag, on_sidebar, self.cursor) {
+                    self.drag = Drag::Pressed(at);
+                } else if let Drag::Moving { target, .. } = self.drag
+                    && overlay.is_some()
+                {
+                    // The release got lost somewhere; a click on an overlay drops it.
+                    return self.finish_drag(target);
+                }
+            }
+            Pointer::Released => match &mut self.drag {
+                Drag::Pressed(_) => self.drag = Drag::Idle,
+                Drag::Moving { released, .. } if !*released => {
+                    *released = true;
+                    return task(async {
+                        tokio::time::sleep(DROP_WAIT).await;
+                        Message::DropTimeout
+                    });
+                }
+                _ => {}
+            },
+            Pointer::Left => {
+                if on_sidebar && matches!(self.drag, Drag::Idle) {
+                    self.cursor = None;
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Where a pointer at this point on the sidebar would drop it, in global coordinates.
+    fn estimate_target(&self, position: Point) -> Option<(usize, Corner)> {
+        let current = &self.outputs[self.current_output()?];
+        #[allow(clippy::cast_precision_loss)]
+        let (x, y) = self.placement.corner.origin(
+            (current.size.0 as f32, current.size.1 as f32),
+            (WIDTH, self.surface_height as f32),
+            MARGIN as f32,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let global = (
+            current.position.0 as f32 + x + position.x,
+            current.position.1 as f32 + y + position.y,
+        );
+        let i = self
+            .outputs
+            .iter()
+            .position(|o| o.contains(global.0, global.1))?;
+        Some((i, self.outputs[i].corner_at(global.0, global.1)))
+    }
+
+    /// Open a transparent drop target overlay on every output.
+    fn start_drag(&mut self, position: Point) -> Task<cosmic::Action<Message>> {
+        if self.outputs.is_empty() {
+            self.drag = Drag::Idle;
+            return Task::none();
+        }
+        let overlays: Vec<(Id, usize)> =
+            (0..self.outputs.len()).map(|i| (Id::unique(), i)).collect();
+        let tasks: Vec<_> = overlays
+            .iter()
+            .map(|(id, i)| {
+                get_layer_surface(SctkLayerSurfaceSettings {
+                    id: *id,
+                    layer: Layer::Overlay,
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    anchor: Anchor::all(),
+                    output: IcedOutput::Output(self.outputs[*i].wl.clone()),
+                    namespace: "deploy-sidebar-drop".into(),
+                    // Stretched across the output by the anchors, panels included.
+                    size: Some((None, None)),
+                    exclusive_zone: -1,
+                    size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let target = self.estimate_target(position);
+        self.drag = Drag::Moving {
+            overlays,
+            target,
+            released: false,
+        };
+        Task::batch(tasks)
+    }
+
+    /// The pointer never reached an overlay after the drop, so go with the estimate.
+    fn drop_timeout(&mut self) -> Task<cosmic::Action<Message>> {
+        match self.drag {
+            Drag::Moving {
+                released: true,
+                target,
+                ..
+            } => self.finish_drag(target),
+            _ => Task::none(),
+        }
+    }
+
+    /// Close the overlays, and move the sidebar if it landed somewhere.
+    fn finish_drag(&mut self, target: Option<(usize, Corner)>) -> Task<cosmic::Action<Message>> {
+        let close = self.close_overlays();
+        let Some((output, corner)) = target else {
+            return close;
+        };
+        let placement = Placement {
+            corner,
+            output: self.outputs[output].name.clone(),
+        };
+        if placement == self.placement && self.current_output() == Some(output) {
+            return close;
+        }
+        if let Err(e) = placement::save(&placement) {
+            eprintln!("Saving the sidebar position: {e}");
+        }
+        self.placement = placement;
+        Task::batch([close, self.reopen_surface()])
+    }
+
+    fn close_overlays(&mut self) -> Task<cosmic::Action<Message>> {
+        match std::mem::replace(&mut self.drag, Drag::Idle) {
+            Drag::Moving { overlays, .. } => Task::batch(
+                overlays
+                    .into_iter()
+                    .map(|(id, _)| destroy_layer_surface(id)),
+            ),
+            _ => Task::none(),
+        }
+    }
+
+    /// One output's overlay during a drag: the four corners, with the one it would land in lit.
+    fn drop_overlay(&self, output: usize, target: Option<(usize, Corner)>) -> Element<'_, Message> {
+        let palette = Palette::new(1.0);
+        #[allow(clippy::cast_precision_loss)]
+        let height = (self.surface_height as f32)
+            .min(
+                self.outputs
+                    .get(output)
+                    .map_or(400.0, |o| o.size.1 as f32 / 2.0)
+                    - 40.0,
+            )
+            .max(60.0);
+        let ghost = |corner: Corner| -> Element<'_, Message> {
+            let lit = target == Some((output, corner));
+            let mut fill = palette.accent;
+            fill.a = if lit { 0.3 } else { 0.06 };
+            let border = if lit { palette.accent } else { palette.divider };
+            widget::container(widget::Space::new(0, 0))
+                .width(Length::Fixed(WIDTH))
+                .height(Length::Fixed(height))
+                .class(cosmic::theme::Container::custom(move |_| {
+                    cosmic::iced::widget::container::Style {
+                        background: Some(fill.into()),
+                        border: cosmic::iced::Border {
+                            radius: 12.0.into(),
+                            width: if lit { 2.0 } else { 1.0 },
+                            color: border,
+                        },
+                        ..Default::default()
+                    }
+                }))
+                .into()
+        };
+        let row = |left: Corner, right: Corner| {
+            widget::row::with_capacity(3)
+                .push(ghost(left))
+                .push(widget::horizontal_space())
+                .push(ghost(right))
+        };
+        #[allow(clippy::cast_precision_loss)]
+        widget::container(
+            widget::column::with_capacity(3)
+                .push(row(Corner::TopLeft, Corner::TopRight))
+                .push(widget::vertical_space())
+                .push(row(Corner::BottomLeft, Corner::BottomRight)),
+        )
+        .padding(MARGIN as f32)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .class(cosmic::theme::Container::custom(|_| {
+            cosmic::iced::widget::container::Style {
+                background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.15).into()),
+                ..Default::default()
+            }
+        }))
+        .into()
     }
 
     /// The height the view will lay out at, mirroring the spacing used in `view_window`.
@@ -763,6 +1383,14 @@ impl App {
                 if watch.error.is_some() {
                     height += 24.0;
                 }
+            }
+            if matches!(watch.phase, Phase::Live(_)) {
+                #[allow(clippy::cast_precision_loss)]
+                let routes = watch.breakdowns.values().map(Vec::len).sum::<usize>() as f32;
+                height += routes * (18.0 + 6.0);
+            }
+            if self.hovered.as_deref() == Some(watch.deploy.id.as_str()) {
+                height += LINKS_HEIGHT + 6.0;
             }
             #[allow(clippy::cast_precision_loss)]
             let lines = watch.checklist.lines() as f32;
@@ -852,6 +1480,31 @@ impl App {
             .into()
     }
 
+    /// Links to Grafana and Render, shown while the pointer is over a card.
+    fn links_row<'a>(&self, watch: &Watch, palette: &Palette) -> Element<'a, Message> {
+        let mut links = widget::row::with_capacity(3).spacing(6);
+        if let Some(url) = self.grafana_link(watch) {
+            links = links.push(pill("Grafana ↗", Message::Open(url), palette));
+        }
+        links = links.push(pill(
+            "Deploy log ↗",
+            Message::Open(watch.deploy.url.clone()),
+            palette,
+        ));
+        if let Some(service) = self
+            .config
+            .as_ref()
+            .and_then(|c| c.services.get(watch.service))
+        {
+            let url = format!(
+                "https://dashboard.render.com/web/{}/logs",
+                service.render_service_id
+            );
+            links = links.push(pill("Logs ↗", Message::Open(url), palette));
+        }
+        links.into()
+    }
+
     fn watch_card<'a>(&'a self, watch: &'a Watch, palette: &Palette) -> Element<'a, Message> {
         let metrics = self.metrics(watch.service);
         let now = Utc::now();
@@ -886,7 +1539,7 @@ impl App {
                     .class(text_color(palette.text)),
             )
             .push(widget::horizontal_space())
-            .push(widget::text::caption(status).class(text_color(palette.muted)))
+            .push(widget::text::caption(status).class(text_color(palette.text)))
             .push(link(
                 "✕",
                 palette.muted,
@@ -921,6 +1574,9 @@ impl App {
                 card = card.push(metric_row(
                     metric, points, error, baseline, live_at, palette,
                 ));
+                for change in watch.breakdowns.get(&i).into_iter().flatten() {
+                    card = card.push(breakdown_row(metric, change, palette));
+                }
             }
         }
         if !matches!(watch.checklist, ChecklistState::Off) {
@@ -930,8 +1586,12 @@ impl App {
             }
         }
 
+        if self.hovered.as_deref() == Some(watch.deploy.id.as_str()) {
+            card = card.push(self.links_row(watch, palette));
+        }
+
         let background = palette.card;
-        widget::container(card)
+        let card = widget::container(card)
             .padding(10)
             .width(Length::Fill)
             .class(cosmic::theme::Container::custom(move |_| {
@@ -943,7 +1603,10 @@ impl App {
                     },
                     ..Default::default()
                 }
-            }))
+            }));
+        widget::mouse_area(card)
+            .on_enter(Message::Hover(watch.deploy.id.clone()))
+            .on_exit(Message::Unhover(watch.deploy.id.clone()))
             .into()
     }
 }
@@ -1003,6 +1666,106 @@ fn metric_row<'a>(
                 .width(Length::Fixed(40.0))
                 .align_x(Alignment::End),
         )
+        .into()
+}
+
+/// A half-ticked checklist for the demo's api deploy.
+fn demo_checklist() -> ChecklistState {
+    ChecklistState::Ready(
+        Checklist {
+            clone: "app2".into(),
+            items: vec![
+                "Open a calendar playlist and play a puzzle".into(),
+                "Reorder a playlist and check it saves".into(),
+                "Load the calendar logged out".into(),
+            ],
+            note: None,
+        },
+        vec![true, false, false],
+    )
+}
+
+/// Route breakdowns for the demo's p95 latency, the metric it regresses.
+fn demo_breakdowns() -> HashMap<usize, Vec<SeriesChange>> {
+    HashMap::from([(
+        1,
+        vec![
+            SeriesChange {
+                name: "POST /graphql".into(),
+                baseline: Some(0.21),
+                current: 0.48,
+                level: Level::Bad,
+            },
+            SeriesChange {
+                name: "GET /calendar/:day".into(),
+                baseline: None,
+                current: 0.31,
+                level: Level::Bad,
+            },
+        ],
+    )])
+}
+
+/// A series under a metric that got worse: its labels, current value and change.
+fn breakdown_row<'a>(
+    metric: &config::Metric,
+    change: &SeriesChange,
+    palette: &Palette,
+) -> Element<'a, Message> {
+    let delta = change
+        .baseline
+        .filter(|b| b.abs() >= f64::EPSILON)
+        .and_then(|b| health::delta(b, change.current))
+        .unwrap_or_else(|| "new".to_string());
+    let name = if change.name.is_empty() {
+        "(no labels)".to_string()
+    } else {
+        truncate(&change.name, 34)
+    };
+    widget::row::with_capacity(3)
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .push(
+            widget::text::caption(format!("  ↳ {name}"))
+                .class(text_color(palette.muted))
+                .width(Length::Fill),
+        )
+        .push(
+            widget::text::caption(health::format(metric.unit, change.current))
+                .class(text_color(palette.text))
+                .width(Length::Fixed(62.0))
+                .align_x(Alignment::End),
+        )
+        .push(
+            widget::text::caption(delta)
+                .class(text_color(palette.level(change.level)))
+                .width(Length::Fixed(40.0))
+                .align_x(Alignment::End),
+        )
+        .into()
+}
+
+/// The height of the row of link pills shown while hovering a card.
+const LINKS_HEIGHT: f32 = 24.0;
+
+/// A small rounded link, coloured from the palette so it fades.
+fn pill<'a>(label: &'a str, message: Message, palette: &Palette) -> Element<'a, Message> {
+    let background = palette.divider;
+    let content = widget::container(widget::text::caption(label).class(text_color(palette.text)))
+        .padding([3, 10])
+        .class(cosmic::theme::Container::custom(move |_| {
+            cosmic::iced::widget::container::Style {
+                background: Some(background.into()),
+                border: cosmic::iced::Border {
+                    radius: 12.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }));
+    widget::mouse_area(content)
+        .on_press(message)
+        .interaction(cosmic::iced::mouse::Interaction::Pointer)
         .into()
 }
 
@@ -1134,6 +1897,21 @@ fn checklist_lines<'a>(watch: &'a Watch, palette: &Palette) -> Vec<Element<'a, M
             lines
         }
     }
+}
+
+/// The outputs the compositor reports, as `OutputChange`s.
+fn output_change(change: wayland::OutputEvent, wl: WlOutput) -> Option<OutputChange> {
+    let info = match change {
+        wayland::OutputEvent::Removed => return Some(OutputChange::Removed(wl)),
+        wayland::OutputEvent::Created(info) => info?,
+        wayland::OutputEvent::InfoUpdate(info) => info,
+    };
+    Some(OutputChange::Info(Output {
+        wl,
+        name: info.name,
+        position: info.logical_position.unwrap_or(info.location),
+        size: info.logical_size?,
+    }))
 }
 
 /// The most severe level across a watch's metrics.

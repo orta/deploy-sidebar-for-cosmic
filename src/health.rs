@@ -3,6 +3,8 @@
 //! Judging a metric against its pre-deploy baseline, and formatting its values.
 
 use crate::config::{Direction, Metric, Unit};
+use crate::grafana::Labelled;
+use std::collections::BTreeMap;
 
 /// How far past the baseline (in the bad direction) counts as a warning.
 const WARN_RATIO: f64 = 1.25;
@@ -85,6 +87,71 @@ pub fn delta(baseline: f64, current: f64) -> Option<String> {
     Some(format!("{change:+.0}%"))
 }
 
+/// One series of a breakdown that got worse, e.g. a route whose latency rose.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesChange {
+    pub name: String,
+    /// Absent when the series had no data before the deploy.
+    pub baseline: Option<f64>,
+    pub current: f64,
+    pub level: Level,
+}
+
+/// The series of a breakdown that look worse than their own baseline, worst first.
+///
+/// A series missing before the deploy counts as starting from zero, so a route that only began
+/// failing afterwards still shows. One missing now counts as zero, so a route whose traffic
+/// stopped shows for a metric where lower is worse.
+pub fn worst_series(
+    metric: &Metric,
+    baseline: &Labelled,
+    current: &Labelled,
+    limit: usize,
+) -> Vec<SeriesChange> {
+    let means: BTreeMap<&str, f64> = baseline
+        .iter()
+        .filter_map(|(name, points)| {
+            let values: Vec<f64> = points.iter().map(|(_, v)| *v).collect();
+            mean(&values).map(|m| (name.as_str(), m))
+        })
+        .collect();
+    let mut latest: BTreeMap<&str, f64> = current
+        .iter()
+        .filter_map(|(name, points)| points.last().map(|(_, v)| (name.as_str(), *v)))
+        .collect();
+    if metric.worse == Direction::Lower {
+        for name in means.keys() {
+            latest.entry(name).or_insert(0.0);
+        }
+    }
+
+    let mut changes: Vec<(f64, SeriesChange)> = latest
+        .into_iter()
+        .filter_map(|(name, current)| {
+            let baseline = means.get(name).copied();
+            let level = assess(metric, Some(baseline.unwrap_or(0.0)), Some(current));
+            let b = baseline.unwrap_or(0.0);
+            let severity = match metric.worse {
+                Direction::Higher => current / b.max(metric.floor).max(f64::MIN_POSITIVE),
+                Direction::Lower => b / current.max(f64::MIN_POSITIVE),
+            };
+            (level >= Level::Warn).then(|| {
+                (
+                    severity,
+                    SeriesChange {
+                        name: name.to_string(),
+                        baseline,
+                        current,
+                        level,
+                    },
+                )
+            })
+        })
+        .collect();
+    changes.sort_by(|a, b| b.1.level.cmp(&a.1.level).then(b.0.total_cmp(&a.0)));
+    changes.into_iter().take(limit).map(|(_, c)| c).collect()
+}
+
 fn compact(value: f64) -> String {
     if value >= 1000.0 {
         format!("{:.1}k", value / 1000.0)
@@ -106,7 +173,53 @@ mod tests {
             unit: Unit::Seconds,
             worse,
             floor,
+            breakdown: None,
         }
+    }
+
+    fn series(name: &str, values: &[f64]) -> (String, Vec<(chrono::DateTime<chrono::Utc>, f64)>) {
+        let points = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let t = chrono::DateTime::from_timestamp(i64::try_from(i).unwrap() * 60, 0);
+                (t.unwrap(), *v)
+            })
+            .collect();
+        (name.to_string(), points)
+    }
+
+    #[test]
+    fn worst_series_ranks_regressions_and_new_failures() {
+        let m = metric(Direction::Higher, 0.05);
+        let baseline = vec![
+            series("GET /fine", &[0.1, 0.1]),
+            series("POST /graphql", &[0.2, 0.2]),
+            series("GET /slower", &[0.1, 0.1]),
+        ];
+        let current = vec![
+            series("GET /fine", &[0.1, 0.11]),
+            series("POST /graphql", &[0.3, 0.5]),
+            series("GET /slower", &[0.1, 0.13]),
+            series("POST /new", &[0.4]),
+        ];
+        let worst = worst_series(&m, &baseline, &current, 2);
+        let names: Vec<&str> = worst.iter().map(|c| c.name.as_str()).collect();
+        // Both are bad; /new is 8x the floor, /graphql 2.5x its baseline.
+        assert_eq!(names, ["POST /new", "POST /graphql"]);
+        assert_eq!(worst[0].baseline, None);
+        assert_eq!(worst_series(&m, &baseline, &current, 5).len(), 3);
+    }
+
+    #[test]
+    fn worst_series_notices_vanished_traffic() {
+        let m = metric(Direction::Lower, 1.0);
+        let baseline = vec![series("GET /gone", &[50.0]), series("GET /ok", &[50.0])];
+        let current = vec![series("GET /ok", &[49.0])];
+        let worst = worst_series(&m, &baseline, &current, 3);
+        assert_eq!(worst.len(), 1);
+        assert_eq!(worst[0].name, "GET /gone");
+        assert!(worst[0].current.abs() < f64::EPSILON);
     }
 
     #[test]

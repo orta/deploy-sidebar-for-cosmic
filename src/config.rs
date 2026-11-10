@@ -33,6 +33,10 @@ pub struct Service {
     /// The service's folder inside the repo, so the checklist focuses on its changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
+    /// A Grafana dashboard for the service, as a full URL or a path like `/d/abc/name`. The
+    /// sidebar links to it with the deploy's time range; without it, the link opens Explore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grafana_dashboard: Option<String>,
     #[serde(default)]
     pub metrics: Vec<Metric>,
 }
@@ -60,6 +64,10 @@ pub struct Metric {
     /// Values below this are never flagged, however they compare to the baseline.
     #[serde(default)]
     pub floor: f64,
+    /// The same metric split by a label such as `route`. When the metric looks off, the series
+    /// that got worse are listed under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

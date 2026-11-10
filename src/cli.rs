@@ -122,6 +122,16 @@ async fn check() -> Result<(), String> {
                 Err(e) => format!("error: {e}"),
             };
             println!("  {:<20} {line}", metric.label);
+            if let Some(expr) = &metric.breakdown {
+                let line = match grafana
+                    .query_labelled(expr, from, to, Duration::from_mins(1))
+                    .await
+                {
+                    Ok(series) => format!("{} series", series.len()),
+                    Err(e) => format!("error: {e}"),
+                };
+                println!("  {:<20} {line}", "  breakdown");
+            }
         }
     }
     Ok(())

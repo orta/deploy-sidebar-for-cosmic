@@ -19,6 +19,11 @@ metrics_poll_seconds = 60
 
 # `unit` is one of: count, per_second, seconds, bytes, ratio
 # `worse` is the direction that means trouble: "higher" or "lower"
+# `breakdown` (optional) is the same metric split by a label such as `route`. When the metric
+# looks off, the two series that got worst are listed under it. Filter out low-traffic series,
+# or a route with one slow request will top the list.
+# `grafana_dashboard` (optional, per service) is a dashboard URL or path like "/d/abc/name",
+# linked with the deploy's time range when you hover a card. Without it the link opens Explore.
 # `floor` is a value below which a metric is never flagged, so a rate going from 0.001 to
 # 0.003 does not count as tripling.
 
@@ -40,6 +45,7 @@ worse = "lower"
 [[services.metrics]]
 label = "p95 latency"
 expr = 'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="puzzmo-api"}[2m])))'
+breakdown = 'histogram_quantile(0.95, sum by (le, method, route) (rate(http_request_duration_seconds_bucket{job="puzzmo-api"}[2m]))) and on (method, route) (sum by (method, route) (rate(http_request_duration_seconds_count{job="puzzmo-api"}[2m])) > 1)'
 unit = "seconds"
 worse = "higher"
 floor = 0.2
@@ -47,6 +53,7 @@ floor = 0.2
 [[services.metrics]]
 label = "5xx"
 expr = 'sum(rate(http_request_duration_seconds_count{job="puzzmo-api", status_code=~"5.."}[2m])) or vector(0)'
+breakdown = 'sum by (method, route) (rate(http_request_duration_seconds_count{job="puzzmo-api", status_code=~"5.."}[2m]))'
 unit = "per_second"
 worse = "higher"
 floor = 0.05
@@ -87,6 +94,7 @@ worse = "lower"
 [[services.metrics]]
 label = "Failed SSR"
 expr = 'sum(rate(ssr_documents_total{job="ssr", outcome=~"timeout|error"}[2m])) / sum(rate(ssr_documents_total{job="ssr"}[2m]))'
+breakdown = '(sum by (route) (rate(ssr_document_duration_seconds_count{job="ssr", outcome=~"timeout|error"}[2m])) / sum by (route) (rate(ssr_document_duration_seconds_count{job="ssr"}[2m]))) and (sum by (route) (rate(ssr_document_duration_seconds_count{job="ssr"}[2m])) > 0.2)'
 unit = "ratio"
 worse = "higher"
 floor = 0.01
@@ -94,6 +102,7 @@ floor = 0.01
 [[services.metrics]]
 label = "p95 document"
 expr = 'histogram_quantile(0.95, sum by (le) (rate(ssr_document_duration_seconds_bucket{job="ssr"}[2m])))'
+breakdown = 'histogram_quantile(0.95, sum by (le, route) (rate(ssr_document_duration_seconds_bucket{job="ssr"}[2m]))) and on (route) (sum by (route) (rate(ssr_document_duration_seconds_count{job="ssr"}[2m])) > 0.2)'
 unit = "seconds"
 worse = "higher"
 floor = 0.5
